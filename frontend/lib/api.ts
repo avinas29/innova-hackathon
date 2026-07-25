@@ -8,15 +8,50 @@ import type {
   StreamEvent,
 } from "./types";
 
+const LOCAL_HOSTNAMES = new Set(["localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0"]);
+
 /**
- * API origin.
+ * Resolve the API origin, discarding a value that cannot possibly work.
  *
  * Empty string means "same origin", which is the deployed case: FastAPI serves
- * this bundle and the API from one port, so requests go to relative paths and
- * no CORS is involved. Set NEXT_PUBLIC_API_URL only when running `next dev`
- * against a separately-hosted API.
+ * this bundle and the API from one port, so requests use relative paths and no
+ * CORS is involved. `NEXT_PUBLIC_API_URL` is only for `next dev`, where the UI
+ * runs on :3000 and the API on :8000.
+ *
+ * The guard exists because that dev value is trivially easy to leak into a
+ * production build — a stray line in `.env`, or the same variable set in a
+ * hosting dashboard. The result is a deployed page instructing every visitor's
+ * browser to call `localhost:8000`, i.e. *their own machine*, which fails with
+ * an opaque "Load failed" and a CORS error that looks like a server
+ * misconfiguration. It is never correct, so it is ignored rather than obeyed.
  */
-export const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "";
+function resolveApiBase(): string {
+  const configured = (process.env.NEXT_PUBLIC_API_URL ?? "").trim();
+  if (!configured) return "";
+
+  // No window during static export; keep the configured value as-is.
+  if (typeof window === "undefined") return configured;
+
+  try {
+    const target = new URL(configured, window.location.origin);
+    const pageIsLocal = LOCAL_HOSTNAMES.has(window.location.hostname);
+    const targetIsLocal = LOCAL_HOSTNAMES.has(target.hostname);
+
+    if (targetIsLocal && !pageIsLocal) {
+      console.warn(
+        `[veritas] Ignoring NEXT_PUBLIC_API_URL="${configured}": it points at ` +
+          `localhost but this page is served from ${window.location.origin}. ` +
+          `Falling back to same-origin requests.`,
+      );
+      return "";
+    }
+    return configured;
+  } catch {
+    return "";
+  }
+}
+
+export const API_BASE = resolveApiBase();
 
 class ApiError extends Error {
   constructor(

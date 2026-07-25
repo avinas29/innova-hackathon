@@ -23,12 +23,30 @@ RUN npm ci
 
 COPY frontend/ ./
 
-# Empty means "same origin" — the API is served from this very host, so the
-# bundle uses relative paths. Overridable for a split deployment.
-ARG NEXT_PUBLIC_API_URL=""
-ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
+# Forced empty, and deliberately NOT an ARG.
+#
+# This image always serves the UI and the API from one origin, so relative
+# requests are always correct — there is no deployment of this image where a
+# fixed API host would be right.
+#
+# It must not be an ARG because Render (and other PaaS) automatically pass the
+# service's environment variables into the Docker build. A dev-only
+# NEXT_PUBLIC_API_URL=http://localhost:8000 sitting in the dashboard would then
+# be baked into the bundle, and every visitor's browser would be told to call
+# *their own machine* — which fails as an opaque "Load failed" plus a CORS
+# error that reads like a server fault. Hardcoding empty here removes that
+# whole failure mode.
+ENV NEXT_PUBLIC_API_URL=""
 
 RUN npm run build && test -f out/index.html
+
+# Guard: never ship a bundle that tells browsers to call localhost. Cheap to
+# check, and it turns a silent production breakage into a failed build.
+RUN if grep -rq "localhost:8000" out/_next/static/chunks/; then \
+      echo "BUILD REJECTED: bundle contains a localhost API URL"; \
+      exit 1; \
+    fi; \
+    echo "bundle verified: no hardcoded API host"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
