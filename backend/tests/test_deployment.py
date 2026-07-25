@@ -122,3 +122,29 @@ def test_relative_paths_resolve_without_error(path, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     resolved = resolve_db_path(path)
     assert resolved.parent.is_dir()
+
+
+class TestHealthSurface:
+    """/health is the only way to confirm a deployment picked up its config.
+
+    A provider added to the app but omitted here is invisible: you cannot tell
+    whether the key was saved, or whether the new code even deployed.
+    """
+
+    def test_every_provider_key_is_reported(self):
+        from veritas.config import env_summary
+
+        summary = env_summary()
+        for provider in ("openai", "anthropic", "gemini", "groq"):
+            assert f"{provider}_key_present" in summary, (
+                f"{provider} key status missing from /health — a deploy using it "
+                "could not be verified"
+            )
+
+    def test_no_secret_values_are_exposed(self):
+        """Presence booleans only; never the keys themselves."""
+        from veritas.config import env_summary
+
+        for key, value in env_summary().items():
+            if key.endswith("_key_present"):
+                assert isinstance(value, bool)

@@ -304,6 +304,7 @@ def env_summary() -> dict[str, object]:
         "openai_key_present": bool(s.openai_api_key),
         "anthropic_key_present": bool(s.anthropic_api_key),
         "gemini_key_present": bool(s.gemini_api_key),
+        "groq_key_present": bool(s.groq_api_key),
         "profile": s.profile,
         "rate_limits": s.rate_limit_summary(),
         "cache_enabled": s.cache_enabled,
