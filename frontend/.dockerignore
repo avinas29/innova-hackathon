@@ -1,0 +1,28 @@
+# Keep the build context small. Without this Docker ships node_modules and
+# .next to the daemon on every build — measured at 459MB, several seconds of
+# pure transfer before any work starts. Both are rebuilt inside the image
+# anyway, so sending them is wasted entirely.
+node_modules
+.next
+out
+build
+dist
+
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+.env
+.env.local
+.env.*.local
+
+.git
+.gitignore
+.vscode
+.idea
+.DS_Store
+
+Dockerfile
+.dockerignore
+README.md

@@ -1,0 +1,58 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  @apply bg-zinc-950 text-zinc-100 antialiased;
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+}
+
+::selection {
+  @apply bg-cyan-500/30;
+}
+
+/* Scrollbars: visible enough to signal overflow, quiet enough to ignore. */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  @apply bg-transparent;
+}
+::-webkit-scrollbar-thumb {
+  @apply rounded-full bg-zinc-700;
+}
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-zinc-600;
+}
+
+@layer components {
+  .panel {
+    @apply rounded-xl border border-zinc-800 bg-zinc-900/50 backdrop-blur;
+  }
+
+  .panel-header {
+    @apply flex items-center justify-between border-b border-zinc-800 px-5 py-3;
+  }
+
+  .panel-title {
+    @apply text-sm font-medium tracking-wide text-zinc-300;
+  }
+
+  .stat-label {
+    @apply text-[11px] uppercase tracking-wider text-zinc-500;
+  }
+
+  .stat-value {
+    @apply text-2xl font-semibold tabular-nums text-zinc-100;
+  }
+
+  .badge {
+    @apply inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5
+      text-xs font-medium;
+  }
+}

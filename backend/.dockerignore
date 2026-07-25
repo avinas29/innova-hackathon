@@ -1,0 +1,30 @@
+# The venv alone is hundreds of megabytes and is rebuilt inside the image.
+.venv
+venv
+__pycache__
+**/__pycache__
+*.py[cod]
+
+.pytest_cache
+.ruff_cache
+.mypy_cache
+
+# Local databases and run artefacts must never bake into an image.
+*.db
+*.db-wal
+*.db-shm
+calibration.json
+eval_results.json
+
+.env
+.env.local
+
+.git
+.gitignore
+.vscode
+.idea
+.DS_Store
+
+Dockerfile
+.dockerignore
+tests

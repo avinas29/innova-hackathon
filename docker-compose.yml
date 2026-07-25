@@ -1,0 +1,77 @@
+name: veritas
+
+services:
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      # Passed through from the host shell or a .env file beside this compose
+      # file. Absent keys fall back to the deterministic offline provider, so
+      # the stack still starts.
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      # Model overrides, so a container run uses the same models as the host.
+      VERITAS_MODEL_FAST_GEMINI: ${VERITAS_MODEL_FAST_GEMINI:-gemini-3.1-flash-lite}
+      VERITAS_MODEL_STRONG_GEMINI: ${VERITAS_MODEL_STRONG_GEMINI:-gemini-3.5-flash}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      EXA_API_KEY: ${EXA_API_KEY:-}
+      BRAVE_API_KEY: ${BRAVE_API_KEY:-}
+      # Containers reach each other by service name. A host-style
+      # http://localhost:8080 would resolve to the api container itself, so
+      # search would silently return nothing with no obvious cause.
+      SEARXNG_URL: ${SEARXNG_URL_INTERNAL:-http://searxng:8080}
+      VERITAS_LLM_PROVIDER: ${VERITAS_LLM_PROVIDER:-auto}
+      VERITAS_PROFILE: ${VERITAS_PROFILE:-default}
+      VERITAS_SEARCH_ORDER: ${VERITAS_SEARCH_ORDER:-searxng,tavily,exa,brave,duckduckgo}
+      VERITAS_DB_PATH: /data/veritas.db
+      VERITAS_CORS_ORIGINS: http://localhost:3000
+      VERITAS_LOG_JSON: "true"
+    volumes:
+      - veritas-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    ports:
+      - "3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Self-hosted metasearch. Opt-in:  docker compose --profile searxng up -d searxng
+  #
+  # No API key, no quota, no rate limiting, and it aggregates many engines at
+  # once — which suits a system that issues dozens of queries per run and gets
+  # throttled by every hosted alternative.
+  searxng:
+    image: searxng/searxng:latest
+    profiles: ["searxng"]
+    ports:
+      - "8080:8080"
+    environment:
+      # Must match the published port or SearXNG rejects its own requests.
+      BASE_URL: http://localhost:8080/
+      INSTANCE_NAME: veritas-search
+    volumes:
+      - ./searxng:/etc/searxng:rw
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETGID, SETUID]
+    restart: unless-stopped
+
+volumes:
+  veritas-data:
