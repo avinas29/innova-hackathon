@@ -21,6 +21,11 @@ services:
       # ── Model provider ───────────────────────────────────────────────────
       # Set this in the Render dashboard, not here. `sync: false` marks it as
       # a secret Render prompts for on first deploy and never stores in git.
+      # Groq first — measured at ~4x Gemini's free daily requests and ~4x
+      # faster per call. `sync: false` makes Render prompt for the value and
+      # keeps it out of git.
+      - key: GROQ_API_KEY
+        sync: false
       - key: GEMINI_API_KEY
         sync: false
       - key: OPENAI_API_KEY
@@ -48,8 +53,12 @@ services:
         sync: false
       - key: TAVILY_API_KEY
         sync: false
+      # SearXNG is omitted deliberately: a locally-run instance is unreachable
+      # from Render, and leaving it first in the chain wastes a request on
+      # every query before falling through. Add it back only once SearXNG is
+      # deployed as its own service and SEARXNG_URL points at that service.
       - key: VERITAS_SEARCH_ORDER
-        value: searxng,tavily,brave,duckduckgo
+        value: tavily,brave,duckduckgo
 
       # ── Runtime ──────────────────────────────────────────────────────────
       - key: VERITAS_LOG_JSON

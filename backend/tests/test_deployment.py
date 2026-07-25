@@ -148,3 +148,9 @@ class TestHealthSurface:
         for key, value in env_summary().items():
             if key.endswith("_key_present"):
                 assert isinstance(value, bool)
+
+    def test_render_declares_every_supported_provider_key(self):
+        """An undeclared key gives no field in the Render dashboard to fill in."""
+        render = (Path(__file__).resolve().parents[2] / "render.yaml").read_text()
+        for key in ("GROQ_API_KEY", "GEMINI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+            assert key in render, f"{key} missing from render.yaml"
