@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -374,6 +375,59 @@ def _iso_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def resolve_db_path(preferred: Path | str) -> Path:
+    """Return a writable database path, falling back if the preferred one isn't.
+
+    Startup must not die because a deployment target mounted a directory
+    root-owned or read-only. Container platforms differ in what they make
+    writable, and the failure mode is a bare ``sqlite3.OperationalError:
+    unable to open database file`` with no indication of which path failed.
+
+    Candidates are tried in order: the configured path, ``/tmp``, then the
+    system temp directory. Falling back loses persistence across restarts, so
+    it is logged as a warning rather than silently accepted.
+    """
+    import tempfile
+
+    preferred = Path(preferred)
+    candidates = [
+        preferred,
+        Path("/tmp") / preferred.name,
+        Path(tempfile.gettempdir()) / preferred.name,
+    ]
+
+    for index, candidate in enumerate(candidates):
+        try:
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            # mkdir succeeding does not prove writability — the directory may
+            # already exist and be owned by another user. Probe it.
+            probe = candidate.parent / f".veritas-write-test-{os.getpid()}"
+            probe.touch()
+            probe.unlink()
+        except OSError as exc:
+            log.warning(
+                "database location not writable",
+                path=str(candidate),
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            continue
+
+        if index > 0:
+            log.warning(
+                "falling back to a writable database location — data will NOT "
+                "persist across restarts",
+                requested=str(preferred),
+                using=str(candidate),
+            )
+        return candidate
+
+    raise RuntimeError(
+        f"no writable database location found. Tried: "
+        f"{', '.join(str(c) for c in candidates)}. "
+        "Set VERITAS_DB_PATH to a writable path."
+    )
+
+
 _DB: Database | None = None
 _DB_LOCK = threading.Lock()
 
@@ -387,7 +441,7 @@ def get_db(path: Path | str | None = None) -> Database:
                 from veritas.config import get_settings
 
                 path = get_settings().db_file
-            _DB = Database(path)
+            _DB = Database(resolve_db_path(path))
         return _DB
 
 

@@ -79,7 +79,13 @@ COPY --chown=veritas:veritas backend/pyproject.toml ./
 COPY --from=frontend --chown=veritas:veritas /build/out ./static
 
 USER veritas
-VOLUME ["/data"]
+
+# No VOLUME declaration. Docker materialises a VOLUME as a fresh anonymous
+# mount at container start, which shadows the build-time `chown` and lands
+# root-owned — so the unprivileged user cannot create the database and startup
+# dies with "unable to open database file". docker-compose binds a named volume
+# to /data explicitly, which is the correct place to decide persistence, and
+# platforms like Render need no volume at all.
 EXPOSE 8000
 
 # Render (and most PaaS) inject $PORT and expect the process to bind it.
