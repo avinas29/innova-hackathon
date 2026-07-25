@@ -8,8 +8,15 @@ import type {
   StreamEvent,
 } from "./types";
 
-export const API_BASE =
-  process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+/**
+ * API origin.
+ *
+ * Empty string means "same origin", which is the deployed case: FastAPI serves
+ * this bundle and the API from one port, so requests go to relative paths and
+ * no CORS is involved. Set NEXT_PUBLIC_API_URL only when running `next dev`
+ * against a separately-hosted API.
+ */
+export const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "";
 
 class ApiError extends Error {
   constructor(

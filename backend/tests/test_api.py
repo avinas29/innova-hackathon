@@ -21,9 +21,18 @@ def client():
 
 class TestSystemRoutes:
     def test_root(self, client):
+        """Serves the exported UI when one is bundled, else service metadata.
+
+        Both are valid: the deployed image ships the static build, while a
+        backend-only checkout has nothing to serve.
+        """
         response = client.get("/")
         assert response.status_code == 200
-        assert response.json()["name"] == "VERITAS"
+
+        if "html" in response.headers.get("content-type", "").lower():
+            assert "<html" in response.text.lower()
+        else:
+            assert response.json()["name"] == "VERITAS"
 
     def test_health_exposes_the_active_provider(self, client):
         """A demo must never silently pass offline heuristics off as model output."""
@@ -216,3 +225,49 @@ class TestStreamFormat:
         for line in data_lines:
             decoded = json_mod.loads(line)  # would raise on a double-wrapped frame
             assert isinstance(decoded, dict)
+
+
+class TestStaticFrontendRouting:
+    """Single-origin serving: FastAPI hosts the exported UI and the API.
+
+    The failure this guards against actually shipped: the SPA catch-all raised
+    an exception class that was never imported, so every unmatched /api/* path
+    returned 500 instead of 404. `create_app()` still succeeded, because a
+    NameError inside a function body only fires when that function runs.
+    """
+
+    def test_unknown_api_path_is_404_not_the_html_shell(self, client):
+        response = client.get("/api/definitely-not-a-real-endpoint")
+        assert response.status_code == 404
+        assert "html" not in response.headers.get("content-type", "").lower()
+
+    def test_real_api_routes_still_win_over_the_catch_all(self, client):
+        assert client.get("/health").status_code == 200
+        assert client.get("/openapi.json").status_code == 200
+
+    def test_root_responds(self, client):
+        """Serves the UI when bundled, service metadata when not."""
+        assert client.get("/").status_code == 200
+
+    def test_frontend_dir_requires_an_index(self, tmp_path, monkeypatch):
+        from veritas.api.app import _frontend_dir
+
+        monkeypatch.setenv("VERITAS_STATIC_DIR", str(tmp_path))
+        assert _frontend_dir() != tmp_path, "a directory with no index.html is not a build"
+
+        (tmp_path / "index.html").write_text("<html></html>")
+        assert _frontend_dir() == tmp_path
+
+    def test_traversal_outside_the_export_is_refused(self, tmp_path, monkeypatch):
+        """A path escaping the export dir must not serve arbitrary files."""
+        static = tmp_path / "static"
+        static.mkdir()
+        (static / "index.html").write_text("<html>ui</html>")
+        secret = tmp_path / "secret.txt"
+        secret.write_text("do-not-serve")
+
+        monkeypatch.setenv("VERITAS_STATIC_DIR", str(static))
+        _reset_manager()
+        with TestClient(create_app()) as c:
+            body = c.get("/../secret.txt").text
+        assert "do-not-serve" not in body

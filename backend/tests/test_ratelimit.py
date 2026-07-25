@@ -340,8 +340,7 @@ class TestSearxng:
         active SearXNG was silently omitted from the very place you check when
         retrieval misbehaves.
         """
-        from veritas.config import _provider_key
-        from veritas.config import Settings
+        from veritas.config import Settings, _provider_key
 
         s = Settings(SEARXNG_URL="http://localhost:8080")  # type: ignore[call-arg]
         assert _provider_key(s, "searxng") == "http://localhost:8080"

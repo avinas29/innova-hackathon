@@ -1,0 +1,65 @@
+# Render blueprint — https://render.com/docs/blueprint-spec
+#
+# Deploy: push this repo to GitHub, then in Render choose
+# "New → Blueprint" and select the repository. Render reads this file.
+#
+# One web service. The Dockerfile builds the Next.js UI to static files and
+# bundles them into the FastAPI image, so a single container serves the UI and
+# the API on one port — one URL, no CORS, and nothing to configure between them.
+
+services:
+  - type: web
+    name: veritas
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: free
+    region: oregon
+    healthCheckPath: /health
+
+    envVars:
+      # ── Model provider ───────────────────────────────────────────────────
+      # Set this in the Render dashboard, not here. `sync: false` marks it as
+      # a secret Render prompts for on first deploy and never stores in git.
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+
+      - key: VERITAS_LLM_PROVIDER
+        value: auto
+      # The free plan has limited CPU and the free Gemini tier limited quota;
+      # this profile keeps a run inside both.
+      - key: VERITAS_PROFILE
+        value: free
+      - key: VERITAS_MODEL_FAST_GEMINI
+        value: gemini-3.1-flash-lite
+      - key: VERITAS_MODEL_STRONG_GEMINI
+        value: gemini-3.5-flash
+
+      # ── Search ───────────────────────────────────────────────────────────
+      # SearXNG is not bundled: it is a separate container and cannot run
+      # inside this service. Either deploy it as its own Render service and
+      # put its URL here, or leave blank to fall back to keyless DuckDuckGo
+      # plus Wikipedia/arXiv.
+      - key: SEARXNG_URL
+        sync: false
+      - key: TAVILY_API_KEY
+        sync: false
+      - key: VERITAS_SEARCH_ORDER
+        value: searxng,tavily,brave,duckduckgo
+
+      # ── Runtime ──────────────────────────────────────────────────────────
+      - key: VERITAS_LOG_JSON
+        value: "true"
+      # On the free plan the filesystem is ephemeral and is wiped on every
+      # restart, so runs do not persist. Attach a disk (paid) or move to
+      # Postgres if history matters.
+      - key: VERITAS_DB_PATH
+        value: /tmp/veritas.db
+      # Free instances sleep after inactivity and cold-start slowly; a longer
+      # wall-clock ceiling stops a run being killed mid-flight.
+      - key: VERITAS_MAX_WALL_SECONDS
+        value: "1500"

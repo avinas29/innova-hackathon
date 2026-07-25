@@ -1,0 +1,36 @@
+# Root build context — the single-image build reads both backend/ and frontend/,
+# so exclusions live here rather than in the sub-projects.
+
+**/node_modules
+**/.next
+**/out
+**/.venv
+**/__pycache__
+**/*.py[cod]
+
+**/.pytest_cache
+**/.ruff_cache
+**/.mypy_cache
+
+# Never bake local state or secrets into an image.
+**/*.db
+**/*.db-wal
+**/*.db-shm
+.env
+.env.local
+**/.env.local
+calibration.json
+eval_results.json
+
+.git
+.github
+.vscode
+.idea
+**/.DS_Store
+
+searxng/
+backend/tests
+Dockerfile
+**/Dockerfile
+.dockerignore
+docker-compose.yml

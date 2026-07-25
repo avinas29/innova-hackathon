@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import os
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from veritas.api.routes import router
 from veritas.config import env_summary, get_settings
@@ -80,18 +83,89 @@ def create_app() -> FastAPI:
             content={"detail": "internal server error", "error": str(exc)[:200]},
         )
 
+    # API routes are registered BEFORE the static mount. FastAPI matches in
+    # registration order, so a catch-all mounted first would swallow /api/*.
     app.include_router(router)
 
-    @app.get("/", tags=["system"])
-    async def root() -> dict:
-        return {
-            "name": "VERITAS",
-            "version": "1.0.0",
-            "docs": "/docs",
-            "health": "/health",
-        }
+    _mount_frontend(app)
 
     return app
+
+
+def _frontend_dir() -> Path | None:
+    """Locate the exported Next.js build, if one was bundled.
+
+    Checked in order: an explicit override, the image layout (``/app/static``),
+    then the local monorepo path so `veritas serve` also serves the UI after a
+    `npm run build`.
+    """
+    candidates = [
+        os.environ.get("VERITAS_STATIC_DIR", ""),
+        "/app/static",
+        str(Path(__file__).resolve().parents[3] / "frontend" / "out"),
+    ]
+    for candidate in candidates:
+        if candidate and (Path(candidate) / "index.html").is_file():
+            return Path(candidate)
+    return None
+
+
+def _mount_frontend(app: FastAPI) -> None:
+    """Serve the exported UI from the same origin as the API.
+
+    One process on one port means one Render service, one domain, and no CORS.
+    When no export is present — the usual local setup, with `next dev` on its
+    own port — the API still runs and ``/`` returns service metadata instead.
+    """
+    static_dir = _frontend_dir()
+
+    if static_dir is None:
+        @app.get("/", tags=["system"])
+        async def root() -> dict:
+            return {
+                "name": "VERITAS",
+                "version": "1.0.0",
+                "docs": "/docs",
+                "health": "/health",
+                "ui": "not bundled — run `npm run build` in frontend/, or use the dev server",
+            }
+
+        log.info("no exported frontend found — serving API only")
+        return
+
+    # Hashed build assets are immutable, so they can be cached hard.
+    assets = static_dir / "_next"
+    if assets.is_dir():
+        app.mount("/_next", StaticFiles(directory=assets), name="next-assets")
+
+    @app.get("/", include_in_schema=False)
+    async def index() -> FileResponse:
+        return FileResponse(static_dir / "index.html")
+
+    @app.get("/{path:path}", include_in_schema=False)
+    async def spa(path: str) -> FileResponse:
+        """Serve a static file, falling back to index.html for app routes.
+
+        Registered last, so it only sees paths no API route claimed. Unknown
+        /api/* paths are excluded explicitly — returning the HTML shell for a
+        mistyped endpoint would turn a clear 404 into a confusing parse error
+        in the client.
+        """
+        if path.startswith(("api/", "docs", "redoc", "openapi.json", "health")):
+            raise HTTPException(status_code=404, detail=f"no such endpoint: /{path}")
+
+        target = (static_dir / path).resolve()
+        # Containment check: block traversal outside the export directory.
+        if target.is_file() and target.is_relative_to(static_dir.resolve()):
+            return FileResponse(target)
+
+        nested = target / "index.html"
+        if nested.is_file() and nested.is_relative_to(static_dir.resolve()):
+            return FileResponse(nested)
+
+        return FileResponse(static_dir / "index.html")
+
+    log.info("serving bundled frontend", path=str(static_dir))
 
 
 app = create_app()
