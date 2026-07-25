@@ -26,6 +26,8 @@ os.environ.update(
         "VERITAS_CONSISTENCY_SAMPLES": "1",
         "OPENAI_API_KEY": "",
         "ANTHROPIC_API_KEY": "",
+        "GEMINI_API_KEY": "",
+        "GROQ_API_KEY": "",
         "TAVILY_API_KEY": "",
         "EXA_API_KEY": "",
         "BRAVE_API_KEY": "",

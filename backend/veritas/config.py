@@ -14,13 +14,15 @@ from typing import Literal
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-Provider = Literal["openai", "anthropic", "gemini", "auto", "fake"]
+Provider = Literal["openai", "anthropic", "gemini", "groq", "auto", "fake"]
 EntailmentBackend = Literal["llm", "local"]
 Profile = Literal["default", "free"]
 
 # Gemini speaks the OpenAI wire format at this path, so it reuses the OpenAI
 # SDK rather than needing a separate client.
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+# Groq is OpenAI wire-compatible too, so it reuses the same client.
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -39,6 +41,7 @@ class Settings(BaseSettings):
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
     anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
     gemini_api_key: str = Field(default="", alias="GEMINI_API_KEY")
+    groq_api_key: str = Field(default="", alias="GROQ_API_KEY")
     llm_provider: Provider = Field(default="auto", alias="VERITAS_LLM_PROVIDER")
 
     model_fast: str = Field(default="gpt-4.1-mini", alias="VERITAS_MODEL_FAST")
@@ -62,6 +65,25 @@ class Settings(BaseSettings):
     )
     model_strong_gemini: str = Field(
         default="gemini-3.5-flash", alias="VERITAS_MODEL_STRONG_GEMINI"
+    )
+    # Chosen by measuring a live free key. Groq's binding constraint is TOKENS
+    # per minute, not requests, so the high-volume role must get the model with
+    # the LARGEST token budget — not the one with the most requests.
+    #
+    #   model                     latency  req/day   tok/min
+    #   llama-3.3-70b-versatile     0.37s    1,000    12,000   <- fast role
+    #   openai/gpt-oss-120b         0.83s    1,000     8,000   <- strong role
+    #   llama-3.1-8b-instant        0.32s   14,400     6,000
+    #
+    # 8b-instant's 14,400 requests/day looks generous but is irrelevant: at
+    # ~60 calls per run the request cap is never reached, while its 6,000 TPM
+    # throttles the run to roughly twice the wall-clock of 70b-versatile.
+    # 70b is also the better model, at effectively the same latency.
+    model_fast_groq: str = Field(
+        default="llama-3.3-70b-versatile", alias="VERITAS_MODEL_FAST_GROQ"
+    )
+    model_strong_groq: str = Field(
+        default="openai/gpt-oss-120b", alias="VERITAS_MODEL_STRONG_GROQ"
     )
     embedding_model: str = Field(default="text-embedding-3-small", alias="VERITAS_EMBEDDING_MODEL")
     embedding_model_gemini: str = Field(
@@ -161,6 +183,9 @@ class Settings(BaseSettings):
             return "openai"
         if self.anthropic_api_key:
             return "anthropic"
+        # Groq before Gemini: ~100x the daily requests and several times faster.
+        if self.groq_api_key:
+            return "groq"
         if self.gemini_api_key:
             return "gemini"
         return "fake"
@@ -172,6 +197,8 @@ class Settings(BaseSettings):
             return self.model_strong_anthropic if role == "strong" else self.model_fast_anthropic
         if provider == "gemini":
             return self.model_strong_gemini if role == "strong" else self.model_fast_gemini
+        if provider == "groq":
+            return self.model_strong_groq if role == "strong" else self.model_fast_groq
         return self.model_strong if role == "strong" else self.model_fast
 
     @property
@@ -180,12 +207,16 @@ class Settings(BaseSettings):
             return self.embedding_model_gemini
         return self.embedding_model
 
-    def effective_rate_limits(self) -> dict[str, tuple[int, int]]:
-        """Per-model ``{model: (rpm, requests_per_day)}`` to enforce client-side.
+    def effective_rate_limits(self) -> dict[str, tuple[int, int, int]]:
+        """Per-model ``{model: (rpm, requests_per_day, tpm)}`` enforced client-side.
 
-        Gemini's quotas are per model, so limits are tracked per model rather
-        than pooled — pooling against the strictest model would throttle the
+        Quotas are per model, so limits are tracked per model rather than
+        pooled — pooling against the strictest model would throttle the
         high-volume fast model to the strong model's much smaller budget.
+
+        Which axis actually binds differs by provider: Gemini caps requests per
+        minute (5-15), while Groq is generous on requests but caps tokens per
+        minute. Both are returned and both are enforced.
 
         Explicit ``VERITAS_RPM_LIMIT`` / ``VERITAS_DAILY_LIMIT`` settings apply
         to every model and always win.
@@ -193,9 +224,9 @@ class Settings(BaseSettings):
         models = {self.model_for("fast"), self.model_for("strong")}
 
         if self.rpm_limit or self.daily_limit:
-            return dict.fromkeys(models, (self.rpm_limit, self.daily_limit))
+            return dict.fromkeys(models, (self.rpm_limit, self.daily_limit, 0))
 
-        if self.resolved_provider == "gemini":
+        if self.resolved_provider in {"gemini", "groq"}:
             from veritas.llm.ratelimit import free_tier_limits
 
             return {m: free_tier_limits(m) for m in models}
@@ -207,9 +238,17 @@ class Settings(BaseSettings):
         limits = self.effective_rate_limits()
         if not limits:
             return "unlimited"
-        return ", ".join(
-            f"{model} {rpm}/min {rpd}/day" for model, (rpm, rpd) in sorted(limits.items())
-        )
+        parts = []
+        for model, (rpm, rpd, tpm) in sorted(limits.items()):
+            axes = []
+            if rpm:
+                axes.append(f"{rpm}/min")
+            if rpd:
+                axes.append(f"{rpd}/day")
+            if tpm:
+                axes.append(f"{tpm} tok/min")
+            parts.append(f"{model} {' '.join(axes) or 'unlimited'}")
+        return ", ".join(parts)
 
     def apply_profile(self) -> None:
         """Shrink the workload to fit a constrained quota.

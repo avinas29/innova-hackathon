@@ -98,6 +98,100 @@ class RateLimiter:
             await asyncio.sleep(sleep_for)
 
 
+class TokenRateLimiter:
+    """Sliding-window limiter on tokens per minute.
+
+    Groq's free tier is generous on requests (1,000-14,400 per *day*) but tight
+    on throughput: 6,000-12,000 tokens per minute. A request-only limiter sails
+    straight past that, because our calls are large — an adjudication carries
+    the full evidence set, so a handful of them exhausts a minute's budget while
+    barely denting the request count.
+
+    Token cost is not known until the response arrives, so a call reserves an
+    estimate up front and reconciles against real usage afterwards.
+    """
+
+    def __init__(self, tpm: int, name: str = "default") -> None:
+        self.tpm = tpm
+        self.name = name
+        self._window: deque[tuple[float, int]] = deque()
+        self._lock = asyncio.Lock()
+        self._waits = 0
+        self._wait_seconds = 0.0
+
+    @property
+    def enabled(self) -> bool:
+        return self.tpm > 0
+
+    def _prune(self, now: float) -> int:
+        cutoff = now - 60.0
+        while self._window and self._window[0][0] <= cutoff:
+            self._window.popleft()
+        return sum(tokens for _, tokens in self._window)
+
+    async def acquire(self, estimated_tokens: int) -> None:
+        """Block until ``estimated_tokens`` fit inside the current minute."""
+        if not self.enabled:
+            return
+
+        # A single call larger than the whole budget would never fit; let it
+        # through rather than deadlock, and let the provider decide.
+        estimated_tokens = max(1, min(estimated_tokens, self.tpm))
+
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                used = self._prune(now)
+                if used + estimated_tokens <= self.tpm:
+                    self._window.append((now, estimated_tokens))
+                    return
+                oldest = self._window[0][0]
+                sleep_for = max(0.05, oldest + 60.0 - now + 0.05)
+
+            self._waits += 1
+            self._wait_seconds += sleep_for
+            log.debug(
+                "token budget reached — pacing",
+                limiter=self.name,
+                tpm=self.tpm,
+                used=used,
+                sleep=round(sleep_for, 2),
+            )
+            await asyncio.sleep(sleep_for)
+
+    async def settle(self, estimated_tokens: int, actual_tokens: int) -> None:
+        """Replace the reservation with the true cost once it is known."""
+        if not self.enabled or not self._window:
+            return
+        estimated_tokens = max(1, min(estimated_tokens, self.tpm))
+        async with self._lock:
+            for index in range(len(self._window) - 1, -1, -1):
+                stamp, tokens = self._window[index]
+                if tokens == estimated_tokens:
+                    self._window[index] = (stamp, max(1, actual_tokens))
+                    return
+
+    @property
+    def stats(self) -> dict[str, float]:
+        used = self._prune(time.monotonic())
+        return {
+            "tpm": self.tpm,
+            "tokens_used_this_minute": used,
+            "token_waits": self._waits,
+            "token_wait_seconds": round(self._wait_seconds, 2),
+        }
+
+
+def estimate_tokens(text: str) -> int:
+    """Rough token count for pre-flight reservation.
+
+    ~4 characters per token is the standard English approximation. Only used to
+    reserve budget; the reservation is reconciled with real usage afterwards, so
+    a modest error self-corrects within one window.
+    """
+    return max(1, len(text) // 4)
+
+
 class DailyQuota:
     """Best-effort requests-per-day counter.
 
@@ -176,47 +270,85 @@ GEMINI_FREE_TIER: dict[str, tuple[int, int]] = {
 }
 
 
-def free_tier_limits(model: str) -> tuple[int, int]:
-    """Best-known ``(rpm, rpd)`` for a Gemini model on the free tier.
+# Groq free tier, read directly from this account's `x-ratelimit-*` response
+# headers rather than from docs. Values are (rpm, requests_per_day, tpm).
+#
+# The reset headers disambiguate the windows: `x-ratelimit-reset-requests: 6s`
+# against a 14,400 limit is a *daily* bucket (86400/14400 = 6s per refill),
+# while `x-ratelimit-reset-tokens: 570ms` after spending 57 tokens against a
+# 6,000 limit is a *per-minute* bucket.
+#
+# RPM is left at 0 (unlimited) because Groq does not impose a per-minute request
+# cap on this tier — throughput is governed entirely by tokens.
+GROQ_FREE_TIER: dict[str, tuple[int, int, int]] = {
+    "llama-3.1-8b-instant": (0, 14_400, 6_000),
+    "llama-3.3-70b-versatile": (0, 1_000, 12_000),
+    "openai/gpt-oss-20b": (0, 1_000, 8_000),
+    "openai/gpt-oss-120b": (0, 1_000, 8_000),
+    "openai/gpt-oss-safeguard-20b": (0, 1_000, 8_000),
+    "qwen/qwen3.6-27b": (0, 1_000, 8_000),
+    "groq/compound-mini": (0, 1_000, 8_000),
+    "groq/compound": (0, 1_000, 8_000),
+    "allam-2-7b": (0, 1_000, 6_000),
+}
+
+
+def free_tier_limits(model: str) -> tuple[int, int, int]:
+    """Best-known ``(rpm, requests_per_day, tpm)`` for a model's free tier.
 
     Longest prefix wins so ``gemini-2.5-flash-lite`` is not shadowed by
     ``gemini-2.5-flash``.
     """
+    for prefix in sorted(GROQ_FREE_TIER, key=len, reverse=True):
+        if model.startswith(prefix):
+            return GROQ_FREE_TIER[prefix]
+
     for prefix in sorted(GEMINI_FREE_TIER, key=len, reverse=True):
         if model.startswith(prefix):
-            return GEMINI_FREE_TIER[prefix]
+            rpm, rpd = GEMINI_FREE_TIER[prefix]
+            return (rpm, rpd, 0)  # Gemini's TPM ceiling is not the binding limit
+
     # Unknown models get the strictest observed free-tier rate. Guessing high
     # produces 429 storms; guessing low only costs a little latency.
-    return (5, 100)
+    return (5, 100, 0)
 
 
 class ModelRateLimiters:
-    """Per-model limiters.
+    """Per-model limiters across all three axes: RPM, requests/day, and TPM.
 
-    Gemini's quotas are **per model**, not per project. Pacing everything
-    against the strictest model in play wastes most of the allowance: the fast
-    model carries the bulk of the traffic and typically has 4× the daily quota
-    of the strong one, so a shared limiter would throttle ~90% of calls to the
-    strong model's budget for no reason.
+    Quotas are **per model**, not per project. Pacing everything against the
+    strictest model in play wastes most of the allowance: the fast model carries
+    the bulk of the traffic and usually has a far larger budget than the strong
+    one, so a shared limiter would throttle ~80% of calls for no reason.
 
-    Tracking each model separately gives roughly four times the usable free-tier
-    throughput for the same keys.
+    Which axis binds depends on the provider, so all three are enforced:
+
+    * **Gemini** — requests per minute (5-15). Tiny; RPM binds.
+    * **Groq** — requests per *day* (1,000-14,400) and tokens per minute
+      (6,000-12,000). Requests are effectively free; TPM binds.
     """
 
-    def __init__(self, limits: dict[str, tuple[int, int]]) -> None:
+    def __init__(self, limits: dict[str, tuple[int, int, int]]) -> None:
         self._limiters = {
-            model: RateLimiter(rpm, name=model) for model, (rpm, _) in limits.items()
+            model: RateLimiter(rpm, name=model) for model, (rpm, _, _) in limits.items()
         }
         self._quotas = {
-            model: DailyQuota(rpd, name=model) for model, (_, rpd) in limits.items()
+            model: DailyQuota(rpd, name=model) for model, (_, rpd, _) in limits.items()
+        }
+        self._tokens = {
+            model: TokenRateLimiter(tpm, name=model) for model, (_, _, tpm) in limits.items()
         }
 
     @property
     def enabled(self) -> bool:
-        return any(limiter.enabled for limiter in self._limiters.values())
+        return any(
+            limiter.enabled
+            for group in (self._limiters, self._tokens)
+            for limiter in group.values()
+        ) or any(quota.enabled for quota in self._quotas.values())
 
-    async def acquire(self, model: str) -> None:
-        """Consume daily quota and pace, for one specific model.
+    async def acquire(self, model: str, estimated_tokens: int = 0) -> None:
+        """Reserve budget on every axis for one call to ``model``.
 
         A model with no configured limit passes straight through — an unknown
         model should not be silently throttled to some other model's budget.
@@ -229,10 +361,21 @@ class ModelRateLimiters:
         if limiter is not None:
             await limiter.acquire()
 
+        tokens = self._tokens.get(model)
+        if tokens is not None and estimated_tokens > 0:
+            await tokens.acquire(estimated_tokens)
+
+    async def settle(self, model: str, estimated_tokens: int, actual_tokens: int) -> None:
+        """Reconcile a token reservation against real usage."""
+        tokens = self._tokens.get(model)
+        if tokens is not None and estimated_tokens > 0 and actual_tokens > 0:
+            await tokens.settle(estimated_tokens, actual_tokens)
+
     def stats(self) -> dict[str, dict[str, float]]:
         return {
             model: {
                 **limiter.stats,
+                **self._tokens[model].stats,
                 "daily_remaining": self._quotas[model].remaining,
             }
             for model, limiter in self._limiters.items()

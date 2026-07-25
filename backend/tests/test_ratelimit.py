@@ -99,8 +99,8 @@ class TestDailyQuota:
 
 class TestFreeTierLimits:
     def test_known_models(self):
-        assert free_tier_limits("gemini-2.5-flash-lite") == (15, 1000)
-        assert free_tier_limits("gemini-2.5-pro") == (5, 100)
+        assert free_tier_limits("gemini-2.5-flash-lite") == (15, 1000, 0)
+        assert free_tier_limits("gemini-2.5-pro") == (5, 100, 0)
 
     def test_longest_prefix_wins(self):
         """flash-lite must not be shadowed by the shorter flash prefix."""
@@ -109,7 +109,7 @@ class TestFreeTierLimits:
         )
 
     def test_unknown_model_gets_a_conservative_default(self):
-        rpm, rpd = free_tier_limits("gemini-9.9-experimental")
+        rpm, rpd, _ = free_tier_limits("gemini-9.9-experimental")
         assert rpm > 0 and rpd > 0
 
 
@@ -119,6 +119,9 @@ class TestGeminiConfiguration:
             "OPENAI_API_KEY": "",
             "ANTHROPIC_API_KEY": "",
             "GEMINI_API_KEY": "",
+            # Must be blanked too, or a real key in .env resolves to groq and
+            # these Gemini assertions silently test the wrong provider.
+            "GROQ_API_KEY": "",
             "VERITAS_LLM_PROVIDER": "auto",
         }
         return Settings(**{**base, **overrides})  # type: ignore[arg-type]
@@ -139,7 +142,7 @@ class TestGeminiConfiguration:
         """A free Gemini key must be paced without the user configuring anything."""
         limits = self._settings(GEMINI_API_KEY="k").effective_rate_limits()
         assert limits
-        assert all(rpm > 0 and rpd > 0 for rpm, rpd in limits.values())
+        assert all(rpm > 0 and rpd > 0 for rpm, rpd, _ in limits.values())
 
     def test_limits_are_tracked_per_model(self):
         """Gemini quotas are per model — pooling them wastes the larger budget.
@@ -155,13 +158,13 @@ class TestGeminiConfiguration:
         )
         limits = settings.effective_rate_limits()
 
-        assert limits["gemini-2.5-flash-lite"] == (15, 1000)
-        assert limits["gemini-2.5-pro"] == (5, 100)
+        assert limits["gemini-2.5-flash-lite"] == (15, 1000, 0)
+        assert limits["gemini-2.5-pro"] == (5, 100, 0)
 
     def test_explicit_limits_override_every_model(self):
         settings = self._settings(GEMINI_API_KEY="k", VERITAS_RPM_LIMIT="60")
         limits = settings.effective_rate_limits()
-        assert limits and all(rpm == 60 for rpm, _ in limits.values())
+        assert limits and all(rpm == 60 for rpm, _, _ in limits.values())
 
     def test_other_providers_are_unpaced_by_default(self):
         assert self._settings(OPENAI_API_KEY="k").effective_rate_limits() == {}
@@ -203,14 +206,14 @@ class TestModelRateLimiters:
         """An unlisted model must not inherit another model's budget."""
         from veritas.llm.ratelimit import ModelRateLimiters
 
-        limiters = ModelRateLimiters({"known": (1, 1)})
+        limiters = ModelRateLimiters({"known": (1, 1, 0)})
         for _ in range(20):
             await limiters.acquire("some-other-model")
 
     async def test_models_have_independent_quotas(self):
         from veritas.llm.ratelimit import ModelRateLimiters
 
-        limiters = ModelRateLimiters({"a": (100, 1), "b": (100, 5)})
+        limiters = ModelRateLimiters({"a": (100, 1, 0), "b": (100, 5, 0)})
         await limiters.acquire("a")
 
         # "a" is exhausted, but "b" must be untouched.
@@ -245,7 +248,7 @@ class TestClientWiring:
         settings = get_settings()
         client = LLMClient(settings, provider=OfflineProvider())
         # One request allowed for the whole run: a second network call would raise.
-        client._limiters = ModelRateLimiters({settings.model_for("fast"): (100, 1)})
+        client._limiters = ModelRateLimiters({settings.model_for("fast"): (100, 1, 0)})
 
         await client.chat([user("same prompt")], use_cache=True)
         await client.chat([user("same prompt")], use_cache=True)
@@ -302,10 +305,10 @@ class TestObservedQuotas:
         assert free_tier_limits("gemini-3.6-flash")[0] == 5
 
     def test_lite_models_keep_the_larger_quota(self):
-        assert free_tier_limits("gemini-3.1-flash-lite") == (15, 1000)
+        assert free_tier_limits("gemini-3.1-flash-lite") == (15, 1000, 0)
 
     def test_unknown_models_get_the_strictest_rate(self):
-        assert free_tier_limits("gemini-99-unknown") == (5, 100)
+        assert free_tier_limits("gemini-99-unknown") == (5, 100, 0)
 
 
 class TestSearxng:
@@ -345,3 +348,128 @@ class TestSearxng:
         s = Settings(SEARXNG_URL="http://localhost:8080")  # type: ignore[call-arg]
         assert _provider_key(s, "searxng") == "http://localhost:8080"
         assert _provider_key(s, "unknown-provider") == ""
+
+
+class TestTokenRateLimiter:
+    """Groq caps tokens per minute, not requests.
+
+    A request-only limiter sails past that cap: our calls are large (an
+    adjudication carries the whole evidence set), so a handful exhausts a
+    minute's token budget while barely denting the request count.
+    """
+
+    async def test_disabled_when_tpm_is_zero(self):
+        from veritas.llm.ratelimit import TokenRateLimiter
+
+        limiter = TokenRateLimiter(0)
+        assert not limiter.enabled
+        for _ in range(50):
+            await limiter.acquire(10_000)
+
+    async def test_allows_usage_within_budget(self):
+        from veritas.llm.ratelimit import TokenRateLimiter
+
+        limiter = TokenRateLimiter(6000)
+        started = time.monotonic()
+        for _ in range(5):
+            await limiter.acquire(1000)
+        assert time.monotonic() - started < 0.2
+        assert limiter.stats["token_waits"] == 0
+
+    async def test_paces_once_the_budget_is_spent(self, monkeypatch):
+        from veritas.llm.ratelimit import TokenRateLimiter
+
+        limiter = TokenRateLimiter(1000)
+
+        async def fake_sleep(seconds: float) -> None:
+            limiter._window.clear()
+
+        monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+        await limiter.acquire(900)
+        await limiter.acquire(900)  # would exceed 1000 in the same minute
+        assert limiter.stats["token_waits"] == 1
+
+    async def test_oversized_call_does_not_deadlock(self):
+        """A single call larger than the whole budget must not block forever."""
+        from veritas.llm.ratelimit import TokenRateLimiter
+
+        limiter = TokenRateLimiter(1000)
+        await asyncio.wait_for(limiter.acquire(50_000), timeout=2.0)
+
+    async def test_settle_replaces_the_estimate_with_real_usage(self):
+        from veritas.llm.ratelimit import TokenRateLimiter
+
+        limiter = TokenRateLimiter(10_000)
+        await limiter.acquire(5000)
+        assert limiter.stats["tokens_used_this_minute"] == 5000
+
+        await limiter.settle(5000, 800)
+        assert limiter.stats["tokens_used_this_minute"] == 800
+
+    def test_token_estimate_is_roughly_chars_over_four(self):
+        from veritas.llm.ratelimit import estimate_tokens
+
+        assert estimate_tokens("x" * 400) == 100
+        assert estimate_tokens("") == 1
+
+
+class TestGroqConfiguration:
+    def _settings(self, **overrides) -> Settings:
+        base = {
+            "OPENAI_API_KEY": "",
+            "ANTHROPIC_API_KEY": "",
+            "GEMINI_API_KEY": "",
+            "GROQ_API_KEY": "",
+            "VERITAS_LLM_PROVIDER": "auto",
+        }
+        return Settings(**{**base, **overrides})  # type: ignore[arg-type]
+
+    def test_auto_selects_groq(self):
+        assert self._settings(GROQ_API_KEY="k").resolved_provider == "groq"
+
+    def test_groq_is_preferred_over_gemini(self):
+        """~100x the daily requests and several times faster, measured."""
+        settings = self._settings(GROQ_API_KEY="g", GEMINI_API_KEY="m")
+        assert settings.resolved_provider == "groq"
+
+    def test_openai_still_wins_over_groq(self):
+        settings = self._settings(OPENAI_API_KEY="o", GROQ_API_KEY="g")
+        assert settings.resolved_provider == "openai"
+
+    def test_model_roles(self):
+        settings = self._settings(GROQ_API_KEY="k")
+        # The high-volume role gets the largest TOKEN budget, since tokens —
+        # not requests — are what Groq actually caps.
+        assert settings.model_for("fast") == "llama-3.3-70b-versatile"
+        assert settings.model_for("strong") == "openai/gpt-oss-120b"
+
+    def test_fast_role_has_the_larger_token_budget(self):
+        settings = self._settings(GROQ_API_KEY="k")
+        fast_tpm = free_tier_limits(settings.model_for("fast"))[2]
+        strong_tpm = free_tier_limits(settings.model_for("strong"))[2]
+        assert fast_tpm >= strong_tpm, (
+            "the fast role carries ~80% of tokens and must not be given the "
+            "smaller per-minute budget"
+        )
+
+    def test_observed_quotas_from_live_headers(self):
+        """Values read from this account's x-ratelimit-* response headers."""
+        assert free_tier_limits("llama-3.1-8b-instant") == (0, 14_400, 6_000)
+        assert free_tier_limits("llama-3.3-70b-versatile") == (0, 1_000, 12_000)
+        assert free_tier_limits("openai/gpt-oss-120b") == (0, 1_000, 8_000)
+
+    def test_groq_is_paced_on_tokens_not_requests(self):
+        limits = self._settings(GROQ_API_KEY="k").effective_rate_limits()
+        for rpm, rpd, tpm in limits.values():
+            assert rpm == 0, "Groq imposes no per-minute request cap on this tier"
+            assert rpd > 0 and tpm > 0
+
+    def test_base_url_is_the_openai_compatible_endpoint(self):
+        from veritas.config import GROQ_BASE_URL
+
+        assert GROQ_BASE_URL == "https://api.groq.com/openai/v1"
+
+    def test_summary_reports_the_token_axis(self):
+        summary = self._settings(GROQ_API_KEY="k").rate_limit_summary()
+        assert "tok/min" in summary and "/day" in summary
