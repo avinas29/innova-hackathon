@@ -415,3 +415,29 @@ class TestStreamResume:
 
         assert h.first_seq == 25, "sequence floor must advance as events are dropped"
         assert len(h.events) == _MAX_BUFFER
+
+
+class TestSearchHealthCaching:
+    """The probe runs a live search; on a small instance it measured 15.1s.
+
+    Fired on every page load, competing for the same 0.1 CPU the run needs.
+    Retrieval health does not change second to second, so a slightly stale
+    answer is worth far more than a fresh one that slows the app down.
+    """
+
+    def test_second_call_is_served_from_cache(self, client):
+        first = client.get("/api/search/health").json()
+        second = client.get("/api/search/health").json()
+        assert first.get("cached") is False
+        assert second.get("cached") is True
+        assert second["working"] == first["working"]
+
+    def test_fresh_bypasses_the_cache(self, client):
+        client.get("/api/search/health")
+        forced = client.get("/api/search/health", params={"fresh": True}).json()
+        assert forced.get("cached") is False
+
+    def test_cached_response_reports_its_age(self, client):
+        client.get("/api/search/health")
+        second = client.get("/api/search/health").json()
+        assert "age_seconds" in second

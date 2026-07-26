@@ -84,6 +84,14 @@ class RunManager:
             self._publish(handle, event)
 
         async def runner() -> None:
+            # Let the POST response flush before doing any setup work.
+            #
+            # build_context() constructs five service objects synchronously
+            # (HTTP clients, embedder, vector store). On a small instance that
+            # blocks the event loop for seconds, and because the task starts
+            # eagerly it delayed the 202 response by 9.4s in production. One
+            # yield is enough: the response is already queued.
+            await asyncio.sleep(0)
             try:
                 report = await run_research(topic, run_id, settings, event_sink=sink)
                 handle.report = report

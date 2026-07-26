@@ -176,17 +176,31 @@ async def build_context(
     from veritas.verify.entailment import build_entailment_backend
 
     settings = settings or get_settings()
-    llm = LLMClient(settings)
+
+    # These constructors are synchronous and build HTTP clients, an embedder and
+    # a vector store. On a small instance that is seconds of blocked event loop,
+    # which stalls every concurrent request. Run them on a worker thread.
+    def _build() -> tuple:
+        return (
+            LLMClient(settings),
+            SearchClient(settings),
+            ContentFetcher(settings),
+            AcademicClient(),
+            VectorStore(build_embedder(settings)),
+            _load_confidence_model(),
+        )
+
+    llm, search, fetcher, academic, store, confidence = await asyncio.to_thread(_build)
 
     context = RunContext(
         settings=settings,
         llm=llm,
-        search=SearchClient(settings),
-        fetcher=ContentFetcher(settings),
-        academic=AcademicClient(),
-        vector_store=VectorStore(build_embedder(settings)),
+        search=search,
+        fetcher=fetcher,
+        academic=academic,
+        vector_store=store,
         entailment=build_entailment_backend(llm, settings),
-        confidence_model=_load_confidence_model(),
+        confidence_model=confidence,
         contradiction_detector=ContradictionDetector(llm),
         event_sink=event_sink,
     )

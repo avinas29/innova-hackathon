@@ -360,9 +360,19 @@ async def explain_confidence(
     }
 
 
+# The probe issues a live search, which on a small instance and a cold search
+# backend measured 15.1 SECONDS — on every page load, competing for the same
+# 0.1 CPU the run needs. Cached briefly: retrieval health does not change
+# second to second, and a stale-by-a-minute answer is worth far more than a
+# fresh one that slows the app down.
+_SEARCH_HEALTH_TTL = 90.0
+_search_health_cache: dict[str, object] = {"at": 0.0, "payload": None}
+
+
 @router.get("/api/search/health", tags=["system"])
 async def search_health(
     query: str = Query(default="eiffel tower paris", description="Probe query"),
+    fresh: bool = Query(default=False, description="Bypass the cache"),
 ) -> dict:
     """Live-probe every configured search provider.
 
@@ -376,6 +386,11 @@ async def search_health(
     import time as _time
 
     from veritas.tools.search import SearchClient
+
+    cached = _search_health_cache.get("payload")
+    age = _time.monotonic() - float(_search_health_cache.get("at") or 0.0)
+    if cached and not fresh and age < _SEARCH_HEALTH_TTL:
+        return {**cached, "cached": True, "age_seconds": round(age, 1)}  # type: ignore[dict-item]
 
     settings = get_settings()
     client = SearchClient(settings)
@@ -409,7 +424,7 @@ async def search_health(
         await client.aclose()
 
     working = [r["provider"] for r in results if r.get("ok")]
-    return {
+    payload = {
         "query": query,
         "configured": client.provider_names,
         "working": working,
@@ -422,6 +437,9 @@ async def search_health(
             "come back NEI. Check SEARXNG_URL, or add TAVILY_API_KEY."
         ),
     }
+    _search_health_cache["payload"] = payload
+    _search_health_cache["at"] = _time.monotonic()
+    return {**payload, "cached": False}
 
 
 @router.get("/api/cache/stats", tags=["system"])
