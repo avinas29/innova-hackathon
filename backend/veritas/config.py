@@ -312,8 +312,11 @@ class Settings(BaseSettings):
         """
         if self.profile != "free":
             return
+        # Call count scales as roughly 4 + claims x 4 once entailment is
+        # batched. A free daily allowance can be as low as 20 requests on one
+        # model, so these caps are what keep a run inside it.
         self.max_research_questions = min(self.max_research_questions, 3)
-        self.max_claims = min(self.max_claims, 8)
+        self.max_claims = min(self.max_claims, 5)
         self.max_evidence_per_claim = min(self.max_evidence_per_claim, 4)
         self.consistency_samples = 1
         self.verify_concurrency = min(self.verify_concurrency, 2)

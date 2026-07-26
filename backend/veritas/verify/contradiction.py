@@ -28,7 +28,10 @@ from veritas.schemas import Contradiction, Evidence, Stance
 log = get_logger(__name__)
 
 _MIN_OVERLAP = 0.22           # below this the two snippets aren't about the same thing
-_MAX_PAIRS_PER_CLAIM = 12     # hard ceiling on escalations
+# Hard ceiling on escalations. Contradiction detection is valuable but
+# secondary: it must never consume more budget than the verdicts themselves.
+# At 12 per claim it could out-spend the entire verification stage.
+_MAX_PAIRS_PER_CLAIM = 3
 
 _NUMBER_RE = re.compile(r"(\d[\d,]*\.?\d*)\s*(%|percent|million|billion|trillion|thousand|k|m|bn)?")
 _NEGATION_RE = re.compile(

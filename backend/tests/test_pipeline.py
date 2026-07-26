@@ -391,3 +391,97 @@ class TestHermeticity:
             assert "offline" in page.error
         finally:
             await fetcher.aclose()
+
+
+class TestBatchedEntailment:
+    """Entailment was one API call per evidence item — the pipeline's biggest cost.
+
+    At 8 items x 8 claims that is 64 calls, which on a free tier with a 20/day
+    cap is impossible. Batching makes it one call per claim.
+    """
+
+    async def test_one_call_scores_every_item(self, settings, monkeypatch):
+        from veritas.llm.client import LLMClient, OfflineProvider
+        from veritas.verify.entailment import LLMEntailment
+
+        client = LLMClient(settings, provider=OfflineProvider())
+        calls = {"n": 0}
+        original = client.structured
+
+        async def counted(*a, **kw):
+            calls["n"] += 1
+            return await original(*a, **kw)
+
+        monkeypatch.setattr(client, "structured", counted)
+
+        backend = LLMEntailment(client)
+        evidences = [(f"Evidence text number {i} about sea level rise.", "x.test") for i in range(4)]
+        results = await backend.score_batch("Sea level rose 21cm since 1900", evidences)
+
+        assert len(results) == 4, "must return one judgement per item"
+        assert calls["n"] == 1, f"expected a single batched call, made {calls['n']}"
+
+    async def test_large_batches_are_chunked(self, settings, monkeypatch):
+        from veritas.llm.client import LLMClient, OfflineProvider
+        from veritas.verify.entailment import LLMEntailment
+
+        client = LLMClient(settings, provider=OfflineProvider())
+        backend = LLMEntailment(client)
+        evidences = [(f"Item {i}", "x.test") for i in range(13)]
+        results = await backend.score_batch("a claim", evidences)
+        assert len(results) == 13, "chunking must not lose items"
+
+    async def test_omitted_items_fall_back_rather_than_vanish(self, settings):
+        """Losing evidence silently would corrupt the independence count."""
+        from veritas.verify.entailment import _lexical_judgement
+
+        j = _lexical_judgement(
+            "Sea level rose 21 centimetres since 1900",
+            "Measurements show sea level rose 21 centimetres since 1900.",
+        )
+        assert j.parsed_stance().value == "SUPPORTS"
+
+    async def test_empty_input_makes_no_call(self, settings):
+        from veritas.llm.client import LLMClient, OfflineProvider
+        from veritas.verify.entailment import LLMEntailment
+
+        backend = LLMEntailment(LLMClient(settings, provider=OfflineProvider()))
+        assert await backend.score_batch("claim", []) == []
+
+
+class TestDailyQuotaHandling:
+    """A per-DAY 429 will not clear in 59 seconds; retrying it wastes minutes.
+
+    Production: gemini-3.5-flash has a 20/day free cap. Once exhausted, every
+    call 429'd with "retry in 59s" and the retry logic waited it out five times
+    per call — a 4-minute run became 12.
+    """
+
+    def test_daily_exhaustion_is_recognised(self):
+        from veritas.llm.client import is_daily_quota_exhausted
+
+        real = (
+            "Quota exceeded for metric: generate_content_free_tier_requests, "
+            "limit: 20, model: gemini-3.5-flash. quotaId: "
+            "'GenerateRequestsPerDayPerProjectPerModel-FreeTier'"
+        )
+        assert is_daily_quota_exhausted(real)
+
+    def test_per_minute_limits_are_still_retried(self):
+        from veritas.llm.client import is_daily_quota_exhausted
+
+        per_minute = "quotaId: 'GenerateRequestsPerMinutePerProjectPerModel-FreeTier', limit: 5"
+        assert not is_daily_quota_exhausted(per_minute)
+
+    def test_daily_exhaustion_is_not_a_retryable_error(self):
+        from veritas.llm.client import DailyQuotaExhausted, TransientLLMError, _classify
+
+        err = _classify(RuntimeError("429 quotaId: GenerateRequestsPerDayPerProjectPerModel"))
+        assert isinstance(err, DailyQuotaExhausted)
+        assert not isinstance(err, TransientLLMError), "must not be retried"
+
+    def test_the_message_names_the_way_out(self):
+        from veritas.llm.client import _classify
+
+        msg = str(_classify(RuntimeError("429 GenerateRequestsPerDayPerProjectPerModel")))
+        assert "groq" in msg.lower()

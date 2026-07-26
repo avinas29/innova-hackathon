@@ -462,3 +462,27 @@ BASELINE_USER = """<claim>{claim}</claim>
 
 Respond with JSON: {{"verdict": "SUPPORTED|REFUTED|NEI", "confidence": 0.0-1.0, \
 "rationale": "one sentence"}}"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Batched entailment — one call for every piece of evidence on a claim
+# ─────────────────────────────────────────────────────────────────────────────
+
+ENTAILMENT_BATCH_SYSTEM = ENTAILMENT_SYSTEM + """
+
+BATCHING
+You are given SEVERAL numbered evidence items for ONE claim. Judge each one
+INDEPENDENTLY and return one entry per item, keyed by its number.
+
+- Do not let one item influence another. Item 3 saying something does not make
+  item 4 support the claim.
+- Return an entry for EVERY number given, even if the verdict is NEUTRAL.
+- Judge each item only on its own text."""
+
+ENTAILMENT_BATCH_USER = """<claim>{claim}</claim>
+
+<evidence_items>
+{items}
+</evidence_items>
+
+Return one judgement per numbered item above ({count} in total)."""

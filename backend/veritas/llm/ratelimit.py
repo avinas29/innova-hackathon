@@ -269,12 +269,20 @@ GEMINI_FREE_TIER: dict[str, tuple[int, int]] = {
     #   quotaId: GenerateRequestsPerMinutePerProjectPerModel-FreeTier
     # An earlier guess of 10 here caused the limiter to send at twice the
     # permitted rate, so every run collected 429s partway through.
+    #
+    # Daily caps corrected from a second live 429 on this account:
+    #   quotaId: GenerateRequestsPerDayPerProjectPerModel-FreeTier
+    #   limit: 20, model: gemini-3.5-flash
+    # The earlier value of 250/day was badly wrong, so the daily tracker never
+    # fired. The quota ran out silently and every later call 429'd with "retry
+    # in 59s", which the retry logic waited out five times per call — turning a
+    # 4-minute run into 12.
     "gemini-3.1-flash-lite": (15, 1000),
     "gemini-3.5-flash-lite": (15, 1000),
-    "gemini-3.5-flash": (5, 250),
-    "gemini-3.6-flash": (5, 250),
-    "gemini-3.1-pro": (5, 100),
-    "gemini-3": (5, 250),
+    "gemini-3.5-flash": (5, 20),
+    "gemini-3.6-flash": (5, 20),
+    "gemini-3.1-pro": (5, 20),
+    "gemini-3": (5, 20),
 }
 
 

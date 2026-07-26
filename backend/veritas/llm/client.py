@@ -69,6 +69,32 @@ _RETRY_AFTER_RE = re.compile(
 )
 
 
+# Providers name the exhausted quota. A per-minute cap clears in a minute and is
+# worth waiting for; a per-DAY cap will not clear today, and retrying it five
+# times at ~60s each turns one dead call into five minutes of dead air.
+_DAILY_QUOTA_MARKERS = (
+    "perdayperproject",
+    "requestsperday",
+    "generaterequestsperday",
+    "per day",
+    "daily limit",
+    "quota exceeded for metric",
+)
+
+
+def is_daily_quota_exhausted(text: str) -> bool:
+    """True when the provider says the *daily* allowance is gone."""
+    lowered = text.lower().replace("_", "").replace("-", "")
+    if "perminuteperproject" in lowered or "requestsperminute" in lowered:
+        return False  # a per-minute cap: worth waiting out
+    return any(marker.replace("_", "").replace("-", "") in lowered
+               for marker in _DAILY_QUOTA_MARKERS)
+
+
+class DailyQuotaExhausted(LLMError):
+    """The provider's daily allowance is gone; retrying cannot help today."""
+
+
 def parse_retry_after(text: str) -> float | None:
     """Seconds the provider asked us to wait, if it said."""
     match = _RETRY_AFTER_RE.search(text)
@@ -130,6 +156,12 @@ def _classify(exc: Exception) -> LLMError:
         "503",
         "529",
     )
+    if is_daily_quota_exhausted(text):
+        return DailyQuotaExhausted(
+            "daily quota exhausted for this model — retrying will not help today. "
+            "Switch provider (VERITAS_LLM_PROVIDER=groq) or wait for the reset. "
+            f"Provider said: {str(exc)[:200]}"
+        )
     if any(m in name or m in text for m in transient_markers):
         return TransientLLMError(str(exc), retry_after=parse_retry_after(str(exc)))
     return LLMError(str(exc))

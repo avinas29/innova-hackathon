@@ -30,7 +30,12 @@ from pydantic import BaseModel, Field
 from veritas.config import Settings, get_settings
 from veritas.llm.client import LLMClient, containment, system, user
 from veritas.logging import get_logger
-from veritas.prompts import ENTAILMENT_SYSTEM, ENTAILMENT_USER
+from veritas.prompts import (
+    ENTAILMENT_BATCH_SYSTEM,
+    ENTAILMENT_BATCH_USER,
+    ENTAILMENT_SYSTEM,
+    ENTAILMENT_USER,
+)
 from veritas.schemas import Stance
 
 log = get_logger(__name__)
@@ -49,6 +54,20 @@ class EntailmentJudgement(BaseModel):
         if normalised.startswith("REFUT") or normalised in {"CONTRADICTION", "CONTRADICT"}:
             return Stance.REFUTES
         return Stance.NEUTRAL
+
+
+class BatchJudgement(BaseModel):
+    """One judgement inside a batched response, keyed by item number."""
+
+    index: int
+    stance: str = "NEUTRAL"
+    score: float = Field(default=0.0, ge=0.0, le=1.0)
+    relevance: float = Field(default=0.0, ge=0.0, le=1.0)
+    reasoning: str = ""
+
+
+class BatchEntailmentResult(BaseModel):
+    judgements: list[BatchJudgement] = Field(default_factory=list)
 
 
 class EntailmentBackend(ABC):
@@ -78,8 +97,86 @@ class EntailmentBackend(ABC):
 class LLMEntailment(EntailmentBackend):
     name = "llm"
 
+    # Above this, split into chunks: a single prompt carrying a dozen full
+    # evidence snippets risks the model losing track of which item is which.
+    MAX_BATCH = 6
+
     def __init__(self, llm: LLMClient) -> None:
         self.llm = llm
+
+    async def score_batch(
+        self, claim: str, evidences: list[tuple[str, str]], concurrency: int = 8
+    ) -> list[EntailmentJudgement]:
+        """Score every piece of evidence for one claim in a single call.
+
+        This was one API call per evidence item — by far the largest consumer in
+        the whole pipeline. At 8 items per claim and 8 claims that is 64 calls,
+        which on a free tier is most of a daily allowance and most of the
+        wall-clock.
+
+        Batching cuts it to one call per claim (two if there are many items),
+        roughly halving total calls per run. The prompt requires an independent
+        judgement per numbered item, and anything the model omits falls back to
+        the deterministic lexical scorer rather than being silently dropped.
+        """
+        if not evidences:
+            return []
+
+        results: list[EntailmentJudgement] = []
+        for start in range(0, len(evidences), self.MAX_BATCH):
+            chunk = evidences[start : start + self.MAX_BATCH]
+            results.extend(await self._score_chunk(claim, chunk))
+        return results
+
+    async def _score_chunk(
+        self, claim: str, chunk: list[tuple[str, str]]
+    ) -> list[EntailmentJudgement]:
+        items = "\n\n".join(
+            f"[{i}] (source: {domain or 'unknown'})\n{text[:2500]}"
+            for i, (text, domain) in enumerate(chunk)
+        )
+
+        try:
+            result = await self.llm.structured(
+                [
+                    system(ENTAILMENT_BATCH_SYSTEM),
+                    user(
+                        ENTAILMENT_BATCH_USER.format(
+                            claim=claim, items=items, count=len(chunk)
+                        )
+                    ),
+                ],
+                BatchEntailmentResult,
+                role="fast",
+                task="entailment_batch",
+                max_tokens=400 + 220 * len(chunk),
+            )
+            by_index = {j.index: j for j in result.judgements}
+        except Exception as exc:
+            log.warning("batched entailment failed — scoring lexically", error=str(exc)[:200])
+            by_index = {}
+
+        out: list[EntailmentJudgement] = []
+        for i, (text, _domain) in enumerate(chunk):
+            judged = by_index.get(i)
+            if judged is None:
+                # Never silently drop evidence: fall back to lexical overlap so
+                # the item still gets a (conservative) score.
+                out.append(_lexical_judgement(claim, text))
+                continue
+            out.append(
+                _downgrade_if_irrelevant(
+                    claim,
+                    text,
+                    EntailmentJudgement(
+                        stance=judged.stance,
+                        score=judged.score,
+                        relevance=judged.relevance,
+                        reasoning=judged.reasoning,
+                    ),
+                )
+            )
+        return out
 
     async def score(self, claim: str, evidence: str, domain: str = "") -> EntailmentJudgement:
         judgement = await self.llm.structured(
@@ -196,6 +293,48 @@ class LocalCrossEncoderEntailment(EntailmentBackend):
         one_id = self._tokenizer.convert_tokens_to_ids("▁1")  # type: ignore[union-attr]
         pair = torch.tensor([logits[zero_id], logits[one_id]])
         return float(torch.softmax(pair, dim=0)[1].item())
+
+
+def _downgrade_if_irrelevant(
+    claim: str, evidence: str, judgement: EntailmentJudgement
+) -> EntailmentJudgement:
+    """Guard the commonest scoring error: a confident label on off-topic text."""
+    overlap = containment(claim, evidence)
+    if overlap < 0.15 and judgement.parsed_stance() is not Stance.NEUTRAL:
+        return EntailmentJudgement(
+            stance="NEUTRAL",
+            score=0.0,
+            relevance=overlap,
+            reasoning=(
+                f"Downgraded: negligible overlap with claim ({overlap:.2f}). "
+                + judgement.reasoning[:150]
+            ),
+        )
+    return judgement
+
+
+def _lexical_judgement(claim: str, evidence: str) -> EntailmentJudgement:
+    """Deterministic fallback when the model omits an item from a batch."""
+    import re
+
+    overlap = containment(claim, evidence)
+    negated = bool(
+        re.search(r"\b(not|no|never|denies|denied|false|incorrect|refutes)\b", evidence.lower())
+    )
+    if overlap >= 0.55 and not negated:
+        return EntailmentJudgement(
+            stance="SUPPORTS", score=min(0.8, 0.4 + overlap / 2), relevance=overlap,
+            reasoning=f"Lexical fallback: overlap {overlap:.2f}.",
+        )
+    if overlap >= 0.55 and negated:
+        return EntailmentJudgement(
+            stance="REFUTES", score=min(0.7, 0.3 + overlap / 2), relevance=overlap,
+            reasoning=f"Lexical fallback: overlap {overlap:.2f} with negation.",
+        )
+    return EntailmentJudgement(
+        stance="NEUTRAL", score=0.0, relevance=overlap,
+        reasoning=f"Lexical fallback: overlap {overlap:.2f}.",
+    )
 
 
 def build_entailment_backend(
