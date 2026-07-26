@@ -45,20 +45,20 @@ services:
         value: gemini-3.5-flash
 
       # ── Search ───────────────────────────────────────────────────────────
-      # SearXNG is not bundled: it is a separate container and cannot run
-      # inside this service. Either deploy it as its own Render service and
-      # put its URL here, or leave blank to fall back to keyless DuckDuckGo
-      # plus Wikipedia/arXiv.
+      # Wired automatically to the searxng service defined below. Render
+      # substitutes that service's hostname; the client adds the https scheme.
       - key: SEARXNG_URL
-        sync: false
+        fromService:
+          name: veritas-searxng
+          type: web
+          property: host
       - key: TAVILY_API_KEY
         sync: false
-      # SearXNG is omitted deliberately: a locally-run instance is unreachable
-      # from Render, and leaving it first in the chain wastes a request on
-      # every query before falling through. Add it back only once SearXNG is
-      # deployed as its own service and SEARXNG_URL points at that service.
+      # DuckDuckGo blocks datacenter IP ranges, so it fails from any PaaS —
+      # SearXNG (below) is what actually works in deployment. DDG stays last as
+      # a no-op safety net.
       - key: VERITAS_SEARCH_ORDER
-        value: tavily,brave,duckduckgo
+        value: searxng,tavily,brave,duckduckgo
 
       # ── Runtime ──────────────────────────────────────────────────────────
       - key: VERITAS_LOG_JSON
@@ -72,3 +72,29 @@ services:
       # wall-clock ceiling stops a run being killed mid-flight.
       - key: VERITAS_MAX_WALL_SECONDS
         value: "1500"
+
+  # ── Search backend ────────────────────────────────────────────────────────
+  # Self-hosted metasearch. Needed because DuckDuckGo blocks datacenter IPs,
+  # so the keyless fallback that works locally fails from any PaaS.
+  #
+  # No API key and no per-query cost, which suits a system that issues dozens
+  # of queries per run — every hosted search API would either bill or throttle
+  # that volume.
+  - type: web
+    name: veritas-searxng
+    runtime: docker
+    dockerfilePath: ./searxng/Dockerfile
+    dockerContext: ./searxng
+    plan: free
+    region: oregon
+    healthCheckPath: /healthz
+
+    envVars:
+      # SearXNG refuses to start without a secret; Render generates one and
+      # keeps it out of git.
+      - key: SEARXNG_SECRET
+        generateValue: true
+      - key: INSTANCE_NAME
+        value: veritas-search
+      # Render injects PORT at runtime; the entrypoint maps it onto GRANIAN_PORT,
+      # which is what the image actually reads.

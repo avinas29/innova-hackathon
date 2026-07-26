@@ -329,6 +329,23 @@ async def _gather_results(context: RunContext, question: str, kind: str):
         web.extend(reference)
     except Exception:
         pass
+
+    # Keyless rescue. Web search can fail wholesale in deployment — no key
+    # configured, or DuckDuckGo blocking the datacenter IP range that most
+    # hosting providers sit in. Without this the run produces no evidence at
+    # all and every claim degrades to NEI, which looks like a broken system
+    # rather than an unconfigured one. arXiv and Semantic Scholar need no key
+    # and answer from any IP.
+    if not web:
+        log.warning(
+            "no web results — falling back to keyless scholarly sources",
+            question=question[:70],
+        )
+        try:
+            web = await context.academic.search_scholarly(question, limit=6)
+        except Exception as exc:
+            log.warning("scholarly fallback failed", error=str(exc)[:160])
+
     return web[:12]
 
 

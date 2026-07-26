@@ -1,30 +1,33 @@
 # SearXNG configuration for VERITAS.
 #
-# The one line that actually matters is `formats: [json]` — SearXNG serves HTML
-# only by default and answers API requests with HTTP 403. Without it the
-# provider is skipped and you get no search results, with no obvious cause.
+# The line that actually matters is `formats: [json]`. SearXNG serves HTML only
+# by default and answers API requests with HTTP 403 — the single most common
+# reason a self-hosted instance works in a browser but not from code.
 
 use_default_settings: true
 
 server:
-  # Local-only instance; replace if you expose it beyond localhost.
-  secret_key: "veritas-local-dev-change-me"
-  limiter: false          # no bot-detection rate limiting for local use
+  # Injected by the entrypoint; Render generates it, local runs get a random one.
+  secret_key: "ultrasecretkey"
+  # Bot-detection rate limiting would throttle our own agent: a single run
+  # issues dozens of queries in seconds from one IP.
+  limiter: false
   image_proxy: false
+  method: "GET"
 
 search:
   safe_search: 0
   autocomplete: ""
   default_lang: "en"
-  # REQUIRED. Enables the JSON API that VERITAS calls.
+  # REQUIRED — enables the JSON API that VERITAS calls.
   formats:
     - html
     - json
 
+# Snippet quality matters more than result count: when a full page fetch fails,
+# the entailment scorer reads the search snippet instead. Image, video and
+# social engines add noise without adding evidence.
 engines:
-  # Engines that reliably return substantive snippets for fact-checking.
-  # Snippet quality matters more than result count here: the entailment scorer
-  # reads the snippet when a full page fetch fails.
   - name: wikipedia
     disabled: false
   - name: duckduckgo
@@ -41,7 +44,8 @@ engines:
     disabled: false
   - name: pubmed
     disabled: false
-  # Image, video and social engines add noise without adding evidence.
+  - name: crossref
+    disabled: false
   - name: youtube
     disabled: true
   - name: reddit

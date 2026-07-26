@@ -66,6 +66,12 @@ class SearchProvider:
 class TavilyProvider(SearchProvider):
     name = "tavily"
 
+    @property
+    def search_depth(self) -> str:
+        from veritas.config import get_settings
+
+        return get_settings().tavily_search_depth
+
     async def search(self, query: str, limit: int) -> list[SearchResult]:
         resp = await self.client.post(
             "https://api.tavily.com/search",
@@ -73,7 +79,7 @@ class TavilyProvider(SearchProvider):
                 "api_key": self.api_key,
                 "query": query,
                 "max_results": limit,
-                "search_depth": "advanced",
+                "search_depth": self.search_depth,
                 "include_answer": False,
                 "include_raw_content": False,
             },
@@ -165,9 +171,14 @@ class SearxngProvider(SearchProvider):
     name = "searxng"
     requires_key = False
 
+    # A free PaaS instance sleeps when idle and takes ~50s to wake. The shared
+    # client timeout is far shorter, so the first query after a quiet spell
+    # would always fail and the provider would be skipped for the whole run.
+    COLD_START_TIMEOUT = 75.0
+
     def __init__(self, client: httpx.AsyncClient, base_url: str = "") -> None:
         super().__init__(client, api_key="")
-        self.base_url = (base_url or "").rstrip("/")
+        self.base_url = _normalise_base_url(base_url)
 
     @property
     def available(self) -> bool:
@@ -183,6 +194,7 @@ class SearxngProvider(SearchProvider):
                 "safesearch": 0,
             },
             headers={"Accept": "application/json", "User-Agent": _USER_AGENT},
+            timeout=self.COLD_START_TIMEOUT,
         )
 
         if resp.status_code == 403:
@@ -285,6 +297,24 @@ def _unwrap_ddg(href: str) -> str:
         if target:
             return target[0]
     return href
+
+
+def _normalise_base_url(raw: str) -> str:
+    """Accept a bare hostname as well as a full URL.
+
+    Render's ``fromService`` wiring yields a hostname with no scheme
+    (``veritas-searxng.onrender.com``), which httpx rejects outright. Defaulting
+    to https keeps the blueprint declarative instead of requiring the URL to be
+    pasted by hand.
+    """
+    raw = (raw or "").strip().rstrip("/")
+    if not raw:
+        return ""
+    if raw.startswith(("http://", "https://")):
+        return raw
+    # Local hosts are almost never TLS-terminated; anything else on a PaaS is.
+    scheme = "http" if raw.startswith(("localhost", "127.0.0.1", "0.0.0.0")) else "https"
+    return f"{scheme}://{raw}"
 
 
 def _strip_tags(text: str) -> str:

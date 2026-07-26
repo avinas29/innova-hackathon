@@ -473,3 +473,32 @@ class TestGroqConfiguration:
     def test_summary_reports_the_token_axis(self):
         summary = self._settings(GROQ_API_KEY="k").rate_limit_summary()
         assert "tok/min" in summary and "/day" in summary
+
+    def test_bare_hostname_gets_an_https_scheme(self):
+        """Render's `fromService` yields a hostname with no scheme.
+
+        httpx rejects a scheme-less URL outright, so the blueprint wiring would
+        silently disable search without this.
+        """
+        from veritas.tools.search import SearxngProvider
+
+        p = SearxngProvider(None, "veritas-searxng.onrender.com")  # type: ignore[arg-type]
+        assert p.base_url == "https://veritas-searxng.onrender.com"
+
+    def test_localhost_gets_http_not_https(self):
+        from veritas.tools.search import SearxngProvider
+
+        p = SearxngProvider(None, "localhost:8080")  # type: ignore[arg-type]
+        assert p.base_url == "http://localhost:8080"
+
+    def test_explicit_scheme_is_preserved(self):
+        from veritas.tools.search import SearxngProvider
+
+        for url in ("http://x.test:8080", "https://x.test"):
+            assert SearxngProvider(None, url).base_url == url  # type: ignore[arg-type]
+
+    def test_cold_start_timeout_exceeds_paas_wake_time(self):
+        """A free instance takes ~50s to wake; a shorter timeout always fails."""
+        from veritas.tools.search import SearxngProvider
+
+        assert SearxngProvider.COLD_START_TIMEOUT >= 60

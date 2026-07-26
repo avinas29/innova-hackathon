@@ -154,3 +154,87 @@ class TestHealthSurface:
         render = (Path(__file__).resolve().parents[2] / "render.yaml").read_text()
         for key in ("GROQ_API_KEY", "GEMINI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
             assert key in render, f"{key} missing from render.yaml"
+
+
+class TestCredentialHygiene:
+    """Whitespace in a pasted key produces an opaque 401.
+
+    A real deployment failed this way: the key was correct but the dashboard
+    paste carried a trailing newline, and the provider's error said only
+    "Invalid API Key" — nothing about whitespace.
+    """
+
+    def test_keys_are_stripped(self):
+        from veritas.config import Settings
+
+        s = Settings(  # type: ignore[call-arg]
+            GROQ_API_KEY="  gsk_abc \n",
+            GEMINI_API_KEY="\tAIzaKey ",
+            OPENAI_API_KEY=" sk-x\r\n",
+            TAVILY_API_KEY=" tvly-y ",
+        )
+        assert s.groq_api_key == "gsk_abc"
+        assert s.gemini_api_key == "AIzaKey"
+        assert s.openai_api_key == "sk-x"
+        assert s.tavily_api_key == "tvly-y"
+
+    def test_whitespace_only_key_is_treated_as_absent(self):
+        from veritas.config import Settings
+
+        s = Settings(GROQ_API_KEY="   ", GEMINI_API_KEY="", OPENAI_API_KEY="",  # type: ignore[call-arg]
+                     ANTHROPIC_API_KEY="", VERITAS_LLM_PROVIDER="auto")
+        assert s.groq_api_key == ""
+        assert s.resolved_provider == "fake"
+
+    def test_searxng_url_is_stripped(self):
+        from veritas.config import Settings
+
+        assert Settings(SEARXNG_URL=" http://x:8080 ").searxng_url == "http://x:8080"  # type: ignore[call-arg]
+
+
+class TestSearchCostControl:
+    def test_tavily_defaults_to_the_cheaper_depth(self):
+        """'advanced' costs 2 credits per search vs 1 — halving free-tier runs."""
+        from veritas.config import Settings
+
+        assert Settings().tavily_search_depth == "basic"  # type: ignore[call-arg]
+
+
+class TestSearxngService:
+    """The deployed search backend.
+
+    DuckDuckGo blocks datacenter IPs, so the keyless fallback that works
+    locally returns nothing from Render. SearXNG self-hosted is the fix.
+    """
+
+    @property
+    def _root(self) -> Path:
+        return Path(__file__).resolve().parents[2]
+
+    def test_dockerfile_and_entrypoint_exist(self):
+        assert (self._root / "searxng" / "Dockerfile").is_file()
+        assert (self._root / "searxng" / "entrypoint.sh").is_file()
+        assert (self._root / "searxng" / "settings.yml").is_file()
+
+    def test_entrypoint_maps_platform_port_to_granian(self):
+        """The image reads GRANIAN_PORT, not the SEARXNG_* names docs imply."""
+        script = (self._root / "searxng" / "entrypoint.sh").read_text()
+        assert "GRANIAN_PORT" in script
+        assert "${PORT:-8080}" in script
+
+    def test_settings_enable_the_json_api(self):
+        """Without this SearXNG answers API calls with 403 and search dies."""
+        settings = (self._root / "searxng" / "settings.yml").read_text()
+        assert "json" in settings
+        assert "limiter: false" in settings
+
+    def test_render_declares_the_searxng_service(self):
+        render = (self._root / "render.yaml").read_text()
+        assert "veritas-searxng" in render
+        assert "./searxng/Dockerfile" in render
+        assert "/healthz" in render, "confirmed health path on the live image"
+
+    def test_searxng_url_is_wired_from_the_service(self):
+        """Hand-pasting the URL is the step people forget."""
+        render = (self._root / "render.yaml").read_text()
+        assert "fromService" in render

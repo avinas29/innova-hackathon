@@ -99,6 +99,9 @@ class Settings(BaseSettings):
 
     # ── Search providers ─────────────────────────────────────────────────────
     tavily_api_key: str = Field(default="", alias="TAVILY_API_KEY")
+    # "basic" costs 1 credit per search, "advanced" costs 2. On the free
+    # tier (1,000 credits/month) that doubles the number of usable runs.
+    tavily_search_depth: str = Field(default="basic", alias="VERITAS_TAVILY_DEPTH")
     exa_api_key: str = Field(default="", alias="EXA_API_KEY")
     brave_api_key: str = Field(default="", alias="BRAVE_API_KEY")
     # Self-hosted SearXNG base URL, e.g. http://localhost:8080. No key, no
@@ -145,6 +148,28 @@ class Settings(BaseSettings):
 
     # ── API ──────────────────────────────────────────────────────────────────
     cors_origins: str = Field(default="http://localhost:3000", alias="VERITAS_CORS_ORIGINS")
+
+    @field_validator(
+        "openai_api_key",
+        "anthropic_api_key",
+        "gemini_api_key",
+        "groq_api_key",
+        "tavily_api_key",
+        "exa_api_key",
+        "brave_api_key",
+        "searxng_url",
+        mode="before",
+    )
+    @classmethod
+    def _strip_credential(cls, v: object) -> object:
+        """Trim whitespace from credentials.
+
+        Pasting into a hosting dashboard routinely appends a trailing space or
+        newline. Providers reject the result as an invalid key, and the error
+        says nothing about whitespace — it took a live 401 to find. Stripping
+        here removes the entire failure class.
+        """
+        return v.strip() if isinstance(v, str) else v
 
     @field_validator("dedup_threshold")
     @classmethod
