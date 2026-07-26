@@ -502,3 +502,60 @@ class TestGroqConfiguration:
         from veritas.tools.search import SearxngProvider
 
         assert SearxngProvider.COLD_START_TIMEOUT >= 60
+
+
+class TestPromptFitting:
+    """A single request larger than the per-minute cap is a permanent 413.
+
+    Observed live on Groq:
+        Request too large for openai/gpt-oss-120b ... TPM: Limit 8000,
+        Requested 8658
+    Pacing and retries cannot fix it — the prompt has to shrink.
+    """
+
+    def test_oversized_prompt_is_trimmed_to_fit(self):
+        from veritas.llm.client import Message, fit_to_token_budget
+
+        msgs, trimmed = fit_to_token_budget(
+            [Message("system", "rules"), Message("user", "x" * 60_000)],
+            budget_tokens=8000,
+            reserved_output=2000,
+        )
+        assert trimmed
+        assert sum(len(m.content) // 4 for m in msgs) < 8000 - 2000
+
+    def test_system_prompt_survives_intact(self):
+        """System prompts carry the rules; trimming them changes behaviour."""
+        from veritas.llm.client import Message, fit_to_token_budget
+
+        rules = "IMPORTANT RULES " * 100
+        msgs, _ = fit_to_token_budget(
+            [Message("system", rules), Message("user", "x" * 60_000)], 8000, 2000
+        )
+        assert msgs[0].content == rules
+
+    def test_trimming_is_marked_in_the_content(self):
+        from veritas.llm.client import Message, fit_to_token_budget
+
+        msgs, _ = fit_to_token_budget([Message("user", "x" * 60_000)], 8000, 1000)
+        assert "truncated" in msgs[0].content
+
+    def test_prompt_within_budget_is_untouched(self):
+        from veritas.llm.client import Message, fit_to_token_budget
+
+        original = [Message("user", "short prompt")]
+        msgs, trimmed = fit_to_token_budget(original, 8000, 1000)
+        assert not trimmed and msgs == original
+
+    def test_uncapped_model_is_never_trimmed(self):
+        from veritas.llm.client import Message, fit_to_token_budget
+
+        msgs, trimmed = fit_to_token_budget([Message("user", "x" * 200_000)], 0, 1000)
+        assert not trimmed and len(msgs[0].content) == 200_000
+
+    def test_budget_lookup_reports_the_models_cap(self):
+        from veritas.llm.ratelimit import ModelRateLimiters
+
+        limiters = ModelRateLimiters({"m": (0, 1000, 8000)})
+        assert limiters.token_budget("m") == 8000
+        assert limiters.token_budget("unknown") == 0

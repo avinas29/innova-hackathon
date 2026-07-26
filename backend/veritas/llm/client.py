@@ -830,6 +830,19 @@ class LLMClient:
                     text=cached, provider=self._provider.name, model=model, cached=True
                 )
 
+        # Some providers apply the per-minute token cap to a SINGLE request, so
+        # an oversized prompt is rejected outright and no amount of pacing or
+        # retrying helps. Trim it to fit before spending the call.
+        budget = self._limiters.token_budget(model)
+        tagged, was_trimmed = fit_to_token_budget(tagged, budget, max_tokens)
+        if was_trimmed:
+            log.warning(
+                "prompt trimmed to fit the model's token budget",
+                task=task,
+                model=model,
+                budget=budget,
+            )
+
         # Pace only real network calls: cache hits returned above, so a warm
         # rerun costs no quota and no waiting.
         #
@@ -921,6 +934,62 @@ class LLMClient:
 
     async def aclose(self) -> None:
         await self._provider.aclose()
+
+
+def fit_to_token_budget(
+    messages: list[Message], budget_tokens: int, reserved_output: int
+) -> tuple[list[Message], bool]:
+    """Shrink a prompt so the whole request fits inside a per-minute cap.
+
+    Some providers enforce tokens-per-minute as a *per-request* ceiling too, so
+    a single call larger than the budget is rejected with HTTP 413 forever —
+    retries and pacing cannot help. Observed on Groq::
+
+        Request too large for openai/gpt-oss-120b ... TPM: Limit 8000,
+        Requested 8658
+
+    Synthesis and report generation are the calls at risk: both concatenate the
+    entire evidence corpus, so their size scales with how much research
+    succeeded. Trimming the largest message keeps the call alive with slightly
+    less context, which is strictly better than losing the step entirely.
+
+    Returns the (possibly trimmed) messages and whether trimming occurred.
+    """
+    if budget_tokens <= 0:
+        return messages, False
+
+    # Leave headroom: the estimate is approximate and the provider counts the
+    # requested output against the same budget.
+    allowance = budget_tokens - reserved_output - _TOKEN_BUDGET_HEADROOM
+    if allowance <= 0:
+        allowance = max(256, budget_tokens // 2)
+
+    total = sum(_estimate(m.content) for m in messages)
+    if total <= allowance:
+        return messages, False
+
+    # Trim only the largest message — usually the evidence corpus. System
+    # prompts carry the rules and must survive intact.
+    largest = max(range(len(messages)), key=lambda i: len(messages[i].content))
+    others = total - _estimate(messages[largest].content)
+    keep_tokens = max(256, allowance - others)
+    keep_chars = keep_tokens * 4
+
+    trimmed = list(messages)
+    original = trimmed[largest].content
+    if len(original) > keep_chars:
+        trimmed[largest] = Message(
+            trimmed[largest].role,
+            original[:keep_chars] + "\n\n[…truncated to fit the model's token budget]",
+        )
+    return trimmed, True
+
+
+_TOKEN_BUDGET_HEADROOM = 512
+
+
+def _estimate(text: str) -> int:
+    return max(1, len(text) // 4)
 
 
 def _tag_task(messages: list[Message], task: str) -> list[Message]:

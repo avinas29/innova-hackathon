@@ -371,6 +371,15 @@ class ModelRateLimiters:
         if tokens is not None and estimated_tokens > 0 and actual_tokens > 0:
             await tokens.settle(estimated_tokens, actual_tokens)
 
+    def token_budget(self, model: str) -> int:
+        """Per-minute token ceiling for a model, or 0 when uncapped.
+
+        Callers use this to size a prompt *before* sending it: on providers
+        that apply the cap per request, an oversized call is a permanent 413.
+        """
+        limiter = self._tokens.get(model)
+        return limiter.tpm if limiter is not None else 0
+
     def stats(self) -> dict[str, dict[str, float]]:
         return {
             model: {
