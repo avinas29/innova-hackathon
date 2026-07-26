@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
@@ -133,7 +133,7 @@ async def get_run(run_id: str) -> dict:
 
 
 @router.get("/api/runs/{run_id}/stream", tags=["runs"])
-async def stream_run(run_id: str):
+async def stream_run(run_id: str, request: Request):
     """SSE progress stream.
 
     Buffered history replays first, so a client connecting mid-run — or
@@ -143,7 +143,9 @@ async def stream_run(run_id: str):
     handle = manager.get(run_id) or await manager.load_from_db(run_id)
     if handle is None:
         raise HTTPException(status_code=404, detail=f"run {run_id} not found")
-    return EventSourceResponse(manager.stream(run_id))
+    # EventSource sends this automatically when it reconnects after a drop.
+    last_event_id = request.headers.get("Last-Event-ID")
+    return EventSourceResponse(manager.stream(run_id, last_event_id))
 
 
 @router.get("/api/runs/{run_id}/report", response_class=PlainTextResponse, tags=["runs"])

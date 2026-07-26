@@ -34,6 +34,9 @@ class RunHandle:
     report: ResearchReport | None = None
     error: str = ""
     events: list[RunEvent] = field(default_factory=list)
+    # Sequence of events[0]. The buffer is trimmed, so a list index is not a
+    # stable id — a reconnect must resume by sequence, not position.
+    first_seq: int = 0
     subscribers: set[asyncio.Queue] = field(default_factory=set)
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
@@ -132,7 +135,9 @@ class RunManager:
     def _publish(self, handle: RunHandle, event: RunEvent) -> None:
         handle.events.append(event)
         if len(handle.events) > _MAX_BUFFER:
-            del handle.events[: len(handle.events) - _MAX_BUFFER]
+            dropped = len(handle.events) - _MAX_BUFFER
+            del handle.events[:dropped]
+            handle.first_seq += dropped
 
         for queue in list(handle.subscribers):
             try:
@@ -163,7 +168,7 @@ class RunManager:
         if handle is not None:
             handle.subscribers.discard(queue)
 
-    async def stream(self, run_id: str):
+    async def stream(self, run_id: str, last_event_id: str | None = None):
         """Yield SSE payloads: buffered history first, then live events.
 
         Yields dicts, not pre-formatted strings. ``EventSourceResponse`` does the
@@ -172,12 +177,25 @@ class RunManager:
         frames no client can parse.
         """
         handle, queue = await self.subscribe(run_id)
+
+        # Resume point. A fresh subscriber gets the full history; a reconnecting
+        # one gets only what it missed.
+        resume_from = -1
+        if last_event_id:
+            try:
+                resume_from = int(last_event_id)
+            except ValueError:
+                resume_from = -1
+
+        seq = handle.first_seq
         try:
             for event in list(handle.events):
-                yield _sse(event)
+                if seq > resume_from:
+                    yield _sse(event, seq)
+                seq += 1
 
             if handle.finished:
-                yield _sse(_terminal_event(handle))
+                yield _sse(_terminal_event(handle), seq)
                 return
 
             while True:
@@ -187,11 +205,12 @@ class RunManager:
                     # Ping keeps proxies from reaping an idle stream.
                     yield {"event": "ping", "data": "{}"}
                     if handle.finished:
-                        yield _sse(_terminal_event(handle))
+                        yield _sse(_terminal_event(handle), seq)
                         return
                     continue
 
-                yield _sse(event)
+                yield _sse(event, seq)
+                seq += 1
                 if event.payload.get("terminal"):
                     return
         finally:
@@ -239,8 +258,14 @@ def _terminal_event(handle: RunHandle) -> RunEvent:
     )
 
 
-def _sse(event: RunEvent) -> dict[str, str]:
-    """One SSE frame as sse_starlette expects it: ``{"event": ..., "data": ...}``."""
+def _sse(event: RunEvent, seq: int | None = None) -> dict[str, str]:
+    """One SSE frame as sse_starlette expects it.
+
+    The ``id`` matters: on a dropped connection EventSource reconnects
+    automatically and sends the last id back as ``Last-Event-ID``. Without it
+    the server has no way to know what the client already has, replays the
+    whole buffer, and the UI shows the entire run a second time.
+    """
     payload = json.dumps(
         {
             "ts": event.ts.isoformat(),
@@ -251,7 +276,10 @@ def _sse(event: RunEvent) -> dict[str, str]:
         },
         default=str,
     )
-    return {"event": event.node or "message", "data": payload}
+    frame = {"event": event.node or "message", "data": payload}
+    if seq is not None:
+        frame["id"] = str(seq)
+    return frame
 
 
 _MANAGER: RunManager | None = None

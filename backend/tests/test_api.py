@@ -341,3 +341,77 @@ class TestPayloadSize:
         report = body.get("report")
         if report and report.get("sources"):
             assert all("content" not in s for s in report["sources"])
+
+
+class TestStreamResume:
+    """A dropped connection must not replay the whole run.
+
+    EventSource reconnects automatically. Without an `id` on each frame the
+    server has no way to know what the client already received, so it replayed
+    the entire buffer — and the UI showed the run twice end to end. Observed on
+    an 11-minute production run.
+    """
+
+    def _handle(self):
+        from veritas.api.manager import RunHandle
+        from veritas.schemas import RunEvent, RunStatus
+
+        # COMPLETED so the stream terminates after replay instead of blocking
+        # on the live queue — we are testing the replay path only.
+        h = RunHandle(run_id="r", topic="t", status=RunStatus.COMPLETED)
+        h.events = [RunEvent(run_id="r", node="verifier", message=f"e{i}") for i in range(5)]
+        return h
+
+    def test_frames_carry_a_sequential_id(self):
+        from veritas.api.manager import _sse
+        from veritas.schemas import RunEvent
+
+        frame = _sse(RunEvent(run_id="r", node="planner", message="x"), seq=7)
+        assert frame["id"] == "7"
+
+    def test_id_is_omitted_when_not_supplied(self):
+        from veritas.api.manager import _sse
+        from veritas.schemas import RunEvent
+
+        assert "id" not in _sse(RunEvent(run_id="r", node="planner", message="x"))
+
+    async def test_fresh_subscriber_gets_full_history(self):
+        from veritas.api.manager import RunManager
+
+        m = RunManager()
+        m._runs["r"] = self._handle()
+        frames = [f async for f in m.stream("r", last_event_id=None)]
+        assert len([f for f in frames if f.get("event") == "verifier"]) == 5
+
+    async def test_reconnecting_subscriber_gets_only_the_remainder(self):
+        """The exact bug: without this the client sees every event twice."""
+        from veritas.api.manager import RunManager
+
+        m = RunManager()
+        m._runs["r"] = self._handle()
+        frames = [f async for f in m.stream("r", last_event_id="2")]
+        replayed = [f for f in frames if f.get("event") == "verifier"]
+        assert len(replayed) == 2, "should resume after id 2, not replay all 5"
+        assert [f["id"] for f in replayed] == ["3", "4"]
+
+    async def test_malformed_last_event_id_falls_back_to_full_replay(self):
+        from veritas.api.manager import RunManager
+
+        m = RunManager()
+        m._runs["r"] = self._handle()
+        frames = [f async for f in m.stream("r", last_event_id="not-a-number")]
+        assert len([f for f in frames if f.get("event") == "verifier"]) == 5
+
+    def test_trimming_the_buffer_does_not_renumber_events(self):
+        """A list index is not a stable id once the buffer is trimmed."""
+        from veritas.api.manager import _MAX_BUFFER, RunHandle, RunManager
+        from veritas.schemas import RunEvent, RunStatus
+
+        m = RunManager()
+        h = RunHandle(run_id="r", topic="t", status=RunStatus.RUNNING)
+        m._runs["r"] = h
+        for i in range(_MAX_BUFFER + 25):
+            m._publish(h, RunEvent(run_id="r", node="verifier", message=f"e{i}"))
+
+        assert h.first_seq == 25, "sequence floor must advance as events are dropped"
+        assert len(h.events) == _MAX_BUFFER
