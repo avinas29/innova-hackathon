@@ -48,8 +48,10 @@ services:
         value: free
       - key: VERITAS_MODEL_FAST_GEMINI
         value: gemini-3.1-flash-lite
+      # Flash: better verdicts at 20 requests/DAY (~2 runs). Change to
+      # gemini-3.1-flash-lite for 1,000/day if you need volume over quality.
       - key: VERITAS_MODEL_STRONG_GEMINI
-        value: gemini-3.1-flash-lite
+        value: gemini-3.5-flash
 
       # ── Search ───────────────────────────────────────────────────────────
       # Wired automatically to the searxng service defined below. Render

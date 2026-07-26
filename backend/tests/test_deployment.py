@@ -458,3 +458,37 @@ class TestSearxngUrlValidation:
 
         p = SearxngProvider(None, "")  # type: ignore[arg-type]
         assert await p.search("anything", limit=3) == []
+
+
+class TestQuotaTradeOff:
+    """The strong role deliberately uses a 20/day model for verdict quality.
+
+    That is only safe because exhaustion is handled properly: the correct limit
+    is tracked, a per-day 429 fails immediately rather than being retried for
+    minutes, and a run warns up front when the budget cannot cover it.
+    """
+
+    def test_strong_role_prefers_quality_over_volume(self):
+        from veritas.config import Settings
+        from veritas.llm.ratelimit import free_tier_limits
+
+        s = Settings(  # type: ignore[call-arg]
+            GEMINI_API_KEY="k", GROQ_API_KEY="", OPENAI_API_KEY="",
+            ANTHROPIC_API_KEY="", VERITAS_LLM_PROVIDER="auto",
+        )
+        assert s.model_for("strong") == "gemini-3.5-flash"
+        # ~8 strong calls per run, so the cap must still allow at least one.
+        assert free_tier_limits(s.model_for("strong"))[1] >= 8
+
+    def test_the_daily_limit_is_the_real_one(self):
+        """Tracking 250 when the truth is 20 is what caused the 742s run."""
+        from veritas.llm.ratelimit import free_tier_limits
+
+        assert free_tier_limits("gemini-3.5-flash")[1] == 20
+
+    def test_exhaustion_is_not_retried(self):
+        from veritas.llm.client import DailyQuotaExhausted, TransientLLMError, _classify
+
+        err = _classify(RuntimeError("429 GenerateRequestsPerDayPerProjectPerModel limit: 20"))
+        assert isinstance(err, DailyQuotaExhausted)
+        assert not isinstance(err, TransientLLMError)

@@ -117,6 +117,30 @@ class ResearchRunner:
 
         self.context.emit(run_id, "runner", f"Run started: {topic}")
 
+        # Warn before starting if the daily budget cannot cover this run.
+        #
+        # The strong model deliberately sits on a 20/day quota for verdict
+        # quality, which is ~2 runs. Finding that out at claim 4 of 5 wastes the
+        # calls already spent; saying it up front lets the operator decide.
+        remaining = self.context.llm.rate_limit_stats
+        for model, stats in remaining.items():
+            left = stats.get("daily_remaining", -1)
+            if left < 0:
+                continue
+            needed = 8 if model == self.settings.model_for("strong") else 37
+            if left < needed:
+                self.context.emit(
+                    run_id,
+                    "budget",
+                    f"Only {int(left)} requests left today on {model}; this run needs "
+                    f"about {needed}. It will likely stop partway. Switch provider or "
+                    f"wait for the quota reset.",
+                    level="warning",
+                    model=model,
+                    remaining=int(left),
+                    needed=needed,
+                )
+
         # Make sure search is actually awake before the fan-out.
         #
         # A run fires several searches at once. Against a cold free-tier

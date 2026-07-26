@@ -131,20 +131,19 @@ class TestGeminiConfiguration:
         settings = self._settings(GEMINI_API_KEY="k")
         assert "flash-lite" in settings.model_for("fast")
 
-    def test_neither_role_uses_the_20_per_day_model(self):
-        """gemini-3.5-flash is the better model but is capped at 20/DAY.
+    def test_high_volume_role_keeps_the_large_quota(self):
+        """The fast role carries ~80% of calls and must not sit on a small cap.
 
-        At ~8 strong calls per run that limited the whole system to 2 runs a
-        day, and once exhausted every call 429'd until the next reset. Both
-        roles therefore default to Flash-Lite (1,000/day): a slightly weaker
-        adjudicator that runs beats a better one that cannot.
+        The strong role deliberately uses gemini-3.5-flash (20/day) for verdict
+        quality — that is a quality-over-volume trade, and safe now that
+        exhaustion fails fast with a clear message. But putting the fast role
+        there too would exhaust the quota before a single run finished.
         """
         settings = self._settings(GEMINI_API_KEY="k")
-        for role in ("fast", "strong"):
-            _, per_day, _ = free_tier_limits(settings.model_for(role))
-            assert per_day >= 1000, (
-                f"{role} role uses {settings.model_for(role)}, only {per_day}/day"
-            )
+        _, fast_per_day, _ = free_tier_limits(settings.model_for("fast"))
+        assert fast_per_day >= 1000, (
+            f"fast role uses {settings.model_for('fast')}, only {fast_per_day}/day"
+        )
 
     def test_gemini_gets_automatic_rate_limits(self):
         """A free Gemini key must be paced without the user configuring anything."""
