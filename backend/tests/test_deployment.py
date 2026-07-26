@@ -351,3 +351,30 @@ class TestSearchWarmup:
 
         # conftest sets VERITAS_OFFLINE=true for the whole suite.
         assert await warm_searxng("https://x.test", poll_interval=0.01) is False
+
+
+class TestUnresolvableSearchHost:
+    """A non-existent hostname and a sleeping one need different handling.
+
+    Waiting 75s is right for a booting instance and pure waste for a host that
+    does not exist. Seen in production: SEARXNG_URL was left at the Docker
+    Compose service name, which resolves only inside Compose, and every query
+    burned ~17s on DNS before failing.
+    """
+
+    def test_dns_errors_are_recognised(self):
+        from veritas.tools.search import _is_unresolvable
+
+        for msg in (
+            "[Errno -2] Name or service not known",
+            "nodename nor servname provided",
+            "Temporary failure in name resolution",
+        ):
+            assert _is_unresolvable(Exception(msg)), msg
+
+    def test_transient_errors_are_not_mistaken_for_dns(self):
+        """A timeout means asleep — that one IS worth waiting for."""
+        from veritas.tools.search import _is_unresolvable
+
+        for msg in ("Connection timed out", "502 Bad Gateway", "Read timeout"):
+            assert not _is_unresolvable(Exception(msg)), msg

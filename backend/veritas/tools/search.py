@@ -154,6 +154,23 @@ class BraveProvider(SearchProvider):
         ]
 
 
+def _is_unresolvable(exc: Exception) -> bool:
+    """True when the host does not exist, as opposed to being asleep.
+
+    These are different failures with different fixes, and conflating them
+    wastes a run: a sleeping instance is worth waiting 75s for, a hostname that
+    does not exist never will be. Retrying DNS burned ~17s per query and
+    produced a report with two sources instead of twenty-four.
+    """
+    text = str(exc).lower()
+    return (
+        "name or service not known" in text
+        or "nodename nor servname" in text
+        or "temporary failure in name resolution" in text
+        or "getaddrinfo" in text
+    )
+
+
 class SearxngProvider(SearchProvider):
     """Self-hosted SearXNG — metasearch across many engines, no API key.
 
@@ -218,6 +235,17 @@ class SearxngProvider(SearchProvider):
                         self._awake = True
                         return
                 except Exception as exc:
+                    if _is_unresolvable(exc):
+                        log.error(
+                            "SEARXNG_URL does not resolve — search is disabled for this "
+                            "run. Set it to the search service's PUBLIC url (e.g. "
+                            "https://veritas-searxng.onrender.com). A Docker Compose "
+                            "service name like http://searxng:8080 only resolves inside "
+                            "Compose, never on a hosting platform",
+                            url=self.base_url,
+                        )
+                        self.base_url = ""  # skip this provider for the rest of the run
+                        return
                     log.info(
                         "waking SearXNG — a sleeping free instance takes ~50s",
                         attempt=attempt + 1,
