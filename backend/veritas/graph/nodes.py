@@ -431,7 +431,11 @@ async def extract_claims_node(state: GraphState, config: RunnableConfig) -> dict
 
 
 def dispatch_verification(state: GraphState) -> list[Send]:
-    """Map phase: one parallel branch per check-worthy claim."""
+    """Map phase: one parallel branch per check-worthy claim.
+
+    Note this phase typically dominates wall-clock: each claim costs roughly
+    eight model calls, and on a token-capped tier those are paced apart.
+    """
     claims = state.get("claims", [])
     if not claims:
         return ["contradictions"]
@@ -494,6 +498,21 @@ async def _verify_claim_inner(
 ) -> dict[str, Any]:
     settings = context.settings
     claim_text = claim.verify_text
+
+    # Announce the start, not just the finish.
+    #
+    # Verification is by far the longest phase: each claim costs ~8 model calls
+    # carrying full evidence text, and on a token-capped free tier the limiter
+    # deliberately sleeps between them. Emitting only on completion leaves the
+    # UI silent for minutes, which is indistinguishable from a hang — the most
+    # common reason someone kills a run that was working fine.
+    context.emit(
+        run_id,
+        "verifier",
+        f"Verifying: {claim_text[:70]}",
+        claim_id=claim.id,
+        phase="start",
+    )
 
     # ── 5a. Query generation (RARR-style, includes an adversarial query) ─────
     queries = await _generate_queries(context, claim_text)

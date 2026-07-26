@@ -86,6 +86,23 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   health: () => request<HealthResponse>("/health"),
 
+  /** Live probe of each search provider — configured is not the same as working. */
+  searchHealth: () =>
+    request<{
+      configured: string[];
+      working: string[];
+      any_working: boolean;
+      note: string;
+      providers: {
+        provider: string;
+        ok?: boolean;
+        results: number;
+        ms: number;
+        error?: string;
+        note?: string;
+      }[];
+    }>("/api/search/health"),
+
   startRun: (topic: string, maxClaims?: number) =>
     request<{ run_id: string; stream_url: string }>("/api/runs", {
       method: "POST",

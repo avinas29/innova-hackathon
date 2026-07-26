@@ -39,6 +39,10 @@ export default function Home() {
   const [events, setEvents] = useState<StreamEvent[]>([]);
   const [graph, setGraph] = useState<GraphData | null>(null);
   const [health, setHealth] = useState<HealthResponse | null>(null);
+  const [searchOk, setSearchOk] = useState<{
+    working: string[];
+    any_working: boolean;
+  } | null>(null);
   const [tab, setTab] = useState<Tab>("live");
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -46,6 +50,10 @@ export default function Home() {
 
   useEffect(() => {
     api.health().then(setHealth).catch(() => setHealth(null));
+    // Configured != working. A wrong SEARXNG_URL, or DuckDuckGo blocking a
+    // datacenter IP, both look healthy in config and return nothing at run
+    // time — which surfaces only as every claim coming back "not established".
+    api.searchHealth().then(setSearchOk).catch(() => setSearchOk(null));
     return () => unsubscribeRef.current?.();
   }, []);
 
@@ -133,7 +141,25 @@ export default function Home() {
               <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
               {health.config.llm_provider} · {health.config.entailment_backend}{" "}
               entailment ·{" "}
-              {health.config.search_providers.join(", ") || "no search"}
+              {searchOk === null ? (
+                <span title="checking search providers…">
+                  {health.config.search_providers.join(", ") || "no search"}
+                </span>
+              ) : searchOk.any_working ? (
+                <span
+                  className="text-emerald-400"
+                  title={`Live probe: ${searchOk.working.join(", ")} returning results`}
+                >
+                  search: {searchOk.working.join(", ")} ✓
+                </span>
+              ) : (
+                <span
+                  className="text-rose-400"
+                  title="No provider returned results — every claim will come back NEI"
+                >
+                  search: not working
+                </span>
+              )}
             </div>
           ) : (
             <div className="flex items-center gap-2 text-xs text-rose-400">

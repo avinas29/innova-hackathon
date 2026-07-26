@@ -346,6 +346,63 @@ async def explain_confidence(
     }
 
 
+@router.get("/api/search/health", tags=["system"])
+async def search_health(
+    query: str = Query(default="eiffel tower paris", description="Probe query"),
+) -> dict:
+    """Live-probe every configured search provider.
+
+    ``/health`` lists providers that are *configured*; this reports which ones
+    actually answer. The difference matters: a self-hosted SearXNG with a wrong
+    URL, or DuckDuckGo blocking a datacenter IP, both look perfectly healthy in
+    configuration and return nothing at run time. Without this, a deployment
+    that silently retrieves no evidence is indistinguishable from one that
+    works — every claim just comes back "not established".
+    """
+    import time as _time
+
+    from veritas.tools.search import SearchClient
+
+    settings = get_settings()
+    client = SearchClient(settings)
+    results: list[dict] = []
+
+    try:
+        for provider in client._providers:  # noqa: SLF001 - diagnostic surface
+            started = _time.perf_counter()
+            entry: dict = {"provider": provider.name}
+            try:
+                found = await provider.search(query, limit=3)
+                entry.update(
+                    ok=bool(found),
+                    results=len(found),
+                    sample_domains=[r.domain for r in found[:3]],
+                )
+                if not found:
+                    entry["note"] = "reachable but returned no results"
+            except Exception as exc:
+                entry.update(ok=False, results=0, error=f"{type(exc).__name__}: {exc}"[:200])
+            entry["ms"] = round((_time.perf_counter() - started) * 1000)
+            results.append(entry)
+    finally:
+        await client.aclose()
+
+    working = [r["provider"] for r in results if r.get("ok")]
+    return {
+        "query": query,
+        "configured": client.provider_names,
+        "working": working,
+        "any_working": bool(working),
+        "providers": results,
+        "note": (
+            "Retrieval is healthy."
+            if working
+            else "NO search provider is returning results — every claim will "
+            "come back NEI. Check SEARXNG_URL, or add TAVILY_API_KEY."
+        ),
+    }
+
+
 @router.get("/api/cache/stats", tags=["system"])
 async def cache_stats() -> dict:
     row = await asyncio.to_thread(

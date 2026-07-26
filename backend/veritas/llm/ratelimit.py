@@ -150,12 +150,15 @@ class TokenRateLimiter:
 
             self._waits += 1
             self._wait_seconds += sleep_for
-            log.debug(
-                "token budget reached — pacing",
+            # Visible at INFO: on a token-capped tier this is often the only
+            # thing happening for tens of seconds, and silence reads as a hang.
+            emit = log.info if sleep_for >= 5 else log.debug
+            emit(
+                "token budget reached — pacing (this is expected on a free tier)",
                 limiter=self.name,
                 tpm=self.tpm,
                 used=used,
-                sleep=round(sleep_for, 2),
+                sleep_seconds=round(sleep_for, 1),
             )
             await asyncio.sleep(sleep_for)
 
