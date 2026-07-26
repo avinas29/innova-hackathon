@@ -197,12 +197,13 @@ class SearxngProvider(SearchProvider):
     def __init__(self, client: httpx.AsyncClient, base_url: str = "") -> None:
         super().__init__(client, api_key="")
         self.base_url = _normalise_base_url(base_url)
+        self._disabled = False
         self._awake = False
         self._wake_lock = asyncio.Lock()
 
     @property
     def available(self) -> bool:
-        return bool(self.base_url)
+        return bool(self.base_url) and not self._disabled
 
     async def _ensure_awake(self) -> None:
         """Wake a sleeping instance once, with every other caller waiting.
@@ -244,7 +245,11 @@ class SearxngProvider(SearchProvider):
                             "Compose, never on a hosting platform",
                             url=self.base_url,
                         )
-                        self.base_url = ""  # skip this provider for the rest of the run
+                        # Disable via an explicit flag, not by blanking the URL:
+                        # search() would then build "" + "/search" = "/search",
+                        # which httpx rejects as protocol-less — turning a clear
+                        # DNS error into a confusing UnsupportedProtocol one.
+                        self._disabled = True
                         return
                     log.info(
                         "waking SearXNG — a sleeping free instance takes ~50s",
@@ -259,7 +264,11 @@ class SearxngProvider(SearchProvider):
             self._awake = True
 
     async def search(self, query: str, limit: int) -> list[SearchResult]:
+        if self._disabled or not self.base_url:
+            return []
         await self._ensure_awake()
+        if self._disabled:  # the wake attempt may have just disabled us
+            return []
         try:
             return await self._search_once(query, limit)
         except (httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout):
@@ -451,8 +460,22 @@ def _normalise_base_url(raw: str) -> str:
     to https keeps the blueprint declarative instead of requiring the URL to be
     pasted by hand.
     """
-    raw = (raw or "").strip().rstrip("/")
+    raw = (raw or "").strip().rstrip("/").rstrip(".")
     if not raw:
+        return ""
+
+    # A hostname needs a dot or an explicit port. Without one this is almost
+    # certainly the wrong value pasted in — a secret, a service name, a token.
+    # Prepending https:// to it produces a host that cannot resolve, and the
+    # resulting DNS error says nothing about the real mistake.
+    bare = raw.split("://", 1)[-1]
+    if "." not in bare and ":" not in bare and bare not in {"localhost"}:
+        log.error(
+            "SEARXNG_URL does not look like a URL — search disabled. Expected "
+            "something like https://your-searxng.onrender.com. Check you have not "
+            "pasted a secret or a service name into this variable",
+            value=raw[:60],
+        )
         return ""
     if raw.startswith(("http://", "https://")):
         return raw

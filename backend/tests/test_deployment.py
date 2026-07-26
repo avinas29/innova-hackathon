@@ -395,3 +395,66 @@ class TestUnresolvableSearchHost:
         summary = env_summary()
         for key in ("groq_api_key", "gemini_api_key", "openai_api_key", "SEARXNG_SECRET"):
             assert key not in summary
+
+
+class TestSearxngUrlValidation:
+    """A wrong value in SEARXNG_URL must fail loudly, not mysteriously.
+
+    In production this variable was set to the SearXNG *secret* rather than the
+    URL. The old code prepended https:// to it, producing a host that could not
+    resolve, and the only symptom was a bare DNS error that said nothing about
+    the real mistake.
+    """
+
+    def test_a_pasted_secret_is_rejected(self):
+        from veritas.tools.search import _normalise_base_url
+
+        assert _normalise_base_url("veritas-hackathon-secret-9x7k2m") == ""
+        assert _normalise_base_url("https://veritas-hackathon-secret-9x7k2m") == ""
+
+    def test_a_compose_service_name_is_rejected(self):
+        """`searxng` resolves inside Compose and nowhere else."""
+        from veritas.tools.search import _normalise_base_url
+
+        assert _normalise_base_url("searxng") == ""
+
+    def test_real_urls_are_accepted(self):
+        from veritas.tools.search import _normalise_base_url
+
+        assert (
+            _normalise_base_url("https://veritas-searxng.onrender.com")
+            == "https://veritas-searxng.onrender.com"
+        )
+        assert (
+            _normalise_base_url("veritas-searxng.onrender.com")
+            == "https://veritas-searxng.onrender.com"
+        )
+        assert _normalise_base_url("localhost:8080") == "http://localhost:8080"
+
+    def test_trailing_punctuation_is_stripped(self):
+        """Copying a URL out of prose picks up the sentence's full stop."""
+        from veritas.tools.search import _normalise_base_url
+
+        assert (
+            _normalise_base_url("https://veritas-searxng.onrender.com.")
+            == "https://veritas-searxng.onrender.com"
+        )
+
+    async def test_a_disabled_provider_returns_empty_not_an_error(self):
+        """Blanking base_url made search() build "/search" — a protocol-less URL.
+
+        That turned a clear DNS failure into a confusing UnsupportedProtocol
+        error, masking the actual misconfiguration.
+        """
+        from veritas.tools.search import SearxngProvider
+
+        p = SearxngProvider(None, "https://x.test")  # type: ignore[arg-type]
+        p._disabled = True
+        assert await p.search("anything", limit=3) == []
+        assert p.available is False
+
+    async def test_an_unset_url_returns_empty(self):
+        from veritas.tools.search import SearxngProvider
+
+        p = SearxngProvider(None, "")  # type: ignore[arg-type]
+        assert await p.search("anything", limit=3) == []
