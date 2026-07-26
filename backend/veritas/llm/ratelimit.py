@@ -48,9 +48,13 @@ class RateLimiter:
     providers where client-side pacing only adds latency.
     """
 
-    def __init__(self, rpm: int, name: str = "default") -> None:
+    def __init__(self, rpm: int, name: str = "default", window_seconds: float = 60.0) -> None:
         self.rpm = rpm
         self.name = name
+        # Injectable so tests can exercise pacing in milliseconds. The
+        # alternative — monkey-patching asyncio.sleep — reaches the real module
+        # and breaks pytest-asyncio's loop management; it SIGKILLed the suite.
+        self.window_seconds = window_seconds
         self._window: deque[float] = deque()
         self._lock = asyncio.Lock()
         self._waits = 0
@@ -76,7 +80,7 @@ class RateLimiter:
         while True:
             async with self._lock:
                 now = time.monotonic()
-                cutoff = now - 60.0
+                cutoff = now - self.window_seconds
                 while self._window and self._window[0] <= cutoff:
                     self._window.popleft()
 
@@ -111,9 +115,10 @@ class TokenRateLimiter:
     estimate up front and reconciles against real usage afterwards.
     """
 
-    def __init__(self, tpm: int, name: str = "default") -> None:
+    def __init__(self, tpm: int, name: str = "default", window_seconds: float = 60.0) -> None:
         self.tpm = tpm
         self.name = name
+        self.window_seconds = window_seconds
         self._window: deque[tuple[float, int]] = deque()
         self._lock = asyncio.Lock()
         self._waits = 0
@@ -124,7 +129,7 @@ class TokenRateLimiter:
         return self.tpm > 0
 
     def _prune(self, now: float) -> int:
-        cutoff = now - 60.0
+        cutoff = now - self.window_seconds
         while self._window and self._window[0][0] <= cutoff:
             self._window.popleft()
         return sum(tokens for _, tokens in self._window)
@@ -146,7 +151,7 @@ class TokenRateLimiter:
                     self._window.append((now, estimated_tokens))
                     return
                 oldest = self._window[0][0]
-                sleep_for = max(0.05, oldest + 60.0 - now + 0.05)
+                sleep_for = max(0.01, oldest + self.window_seconds - now + 0.01)
 
             self._waits += 1
             self._wait_seconds += sleep_for

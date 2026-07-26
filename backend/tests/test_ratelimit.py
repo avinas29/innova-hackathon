@@ -39,33 +39,27 @@ class TestRateLimiter:
         assert time.monotonic() - started < 0.2
         assert limiter.stats["waits"] == 0
 
-    async def test_paces_once_the_window_is_full(self, monkeypatch):
-        """The 11th call within a minute must wait, not fail."""
-        limiter = RateLimiter(3)
-        slept: list[float] = []
+    async def test_paces_once_the_window_is_full(self):
+        """The call past the limit must wait, not fail.
 
-        async def fake_sleep(seconds: float) -> None:
-            slept.append(seconds)
-            # Age the window so the loop makes progress without real waiting.
-            limiter._window.clear()
+        Uses a millisecond window rather than patching asyncio.sleep — that
+        patch reaches the real module and breaks pytest-asyncio's loop
+        management, which SIGKILLed the suite.
+        """
+        limiter = RateLimiter(3, window_seconds=0.15)
 
-        monkeypatch.setattr(asyncio, "sleep", fake_sleep)
-
+        started = time.monotonic()
         for _ in range(4):
             await limiter.acquire()
+        elapsed = time.monotonic() - started
 
-        assert slept, "the fourth call should have paced"
-        assert limiter.stats["waits"] == 1
+        assert limiter.stats["waits"] >= 1, "the fourth call should have paced"
+        assert elapsed >= 0.1, "it must actually have waited"
+        assert elapsed < 2.0, "but not for a full minute"
 
-    async def test_is_safe_under_concurrency(self, monkeypatch):
+    async def test_is_safe_under_concurrency(self):
         """Concurrent callers must not collectively exceed the window."""
-        limiter = RateLimiter(5)
-
-        async def fake_sleep(seconds: float) -> None:
-            limiter._window.clear()
-
-        monkeypatch.setattr(asyncio, "sleep", fake_sleep)
-
+        limiter = RateLimiter(5, window_seconds=10.0)
         await asyncio.gather(*(limiter.acquire() for _ in range(5)))
         assert len(limiter._window) == 5
 
@@ -376,25 +370,20 @@ class TestTokenRateLimiter:
         assert time.monotonic() - started < 0.2
         assert limiter.stats["token_waits"] == 0
 
-    async def test_paces_once_the_budget_is_spent(self, monkeypatch):
+    async def test_paces_once_the_budget_is_spent(self):
         from veritas.llm.ratelimit import TokenRateLimiter
 
-        limiter = TokenRateLimiter(1000)
-
-        async def fake_sleep(seconds: float) -> None:
-            limiter._window.clear()
-
-        monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+        limiter = TokenRateLimiter(1000, window_seconds=0.15)
 
         await limiter.acquire(900)
-        await limiter.acquire(900)  # would exceed 1000 in the same minute
-        assert limiter.stats["token_waits"] == 1
+        await limiter.acquire(900)  # would exceed 1000 inside one window
+        assert limiter.stats["token_waits"] >= 1
 
     async def test_oversized_call_does_not_deadlock(self):
         """A single call larger than the whole budget must not block forever."""
         from veritas.llm.ratelimit import TokenRateLimiter
 
-        limiter = TokenRateLimiter(1000)
+        limiter = TokenRateLimiter(1000, window_seconds=0.1)
         await asyncio.wait_for(limiter.acquire(50_000), timeout=2.0)
 
     async def test_settle_replaces_the_estimate_with_real_usage(self):
@@ -672,7 +661,8 @@ class TestSearxngColdStart:
         assert client.healthz_calls == 1
 
     async def test_retries_a_failing_probe(self, monkeypatch):
-        monkeypatch.setattr(asyncio, "sleep", lambda *_: asyncio.sleep(0))
+        _real_sleep = asyncio.sleep
+        monkeypatch.setattr(asyncio, "sleep", lambda *_: _real_sleep(0))
         p, client = self._provider([ConnectionError("cold"), ConnectionError("cold"), 200])
         await p._ensure_awake()
         assert client.healthz_calls == 3
@@ -680,7 +670,8 @@ class TestSearxngColdStart:
 
     async def test_gives_up_but_still_allows_search(self, monkeypatch):
         """/healthz may be blocked while /search works — don't disable the provider."""
-        monkeypatch.setattr(asyncio, "sleep", lambda *_: asyncio.sleep(0))
+        _real_sleep = asyncio.sleep
+        monkeypatch.setattr(asyncio, "sleep", lambda *_: _real_sleep(0))
         p, _ = self._provider([ConnectionError("x")] * 5)
         await p._ensure_awake()
         assert p._awake, "must still attempt the search after a failed probe"
