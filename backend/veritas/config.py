@@ -357,6 +357,9 @@ def env_summary() -> dict[str, object]:
         "gemini_key_present": bool(s.gemini_api_key),
         "groq_key_present": bool(s.groq_api_key),
         "profile": s.profile,
+        # Not a secret, and the only way to diagnose a DNS failure when every
+        # dashboard value is masked.
+        "searxng_url": s.searxng_url or "(unset)",
         "rate_limits": s.rate_limit_summary(),
         "cache_enabled": s.cache_enabled,
         "db_path": str(s.db_file),

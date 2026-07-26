@@ -385,6 +385,13 @@ async def search_health(
         for provider in client._providers:  # noqa: SLF001 - diagnostic surface
             started = _time.perf_counter()
             entry: dict = {"provider": provider.name}
+            # Surface the resolved endpoint. A search backend URL is not a
+            # secret, and a DNS failure is impossible to diagnose from a
+            # dashboard where every value is masked — the exact string the
+            # process holds is the only thing that settles it.
+            target = getattr(provider, "base_url", None)
+            if target:
+                entry["target"] = target
             try:
                 found = await provider.search(query, limit=3)
                 entry.update(

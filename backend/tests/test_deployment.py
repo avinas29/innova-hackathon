@@ -378,3 +378,20 @@ class TestUnresolvableSearchHost:
 
         for msg in ("Connection timed out", "502 Bad Gateway", "Read timeout"):
             assert not _is_unresolvable(Exception(msg)), msg
+
+    def test_search_target_is_visible_for_diagnosis(self):
+        """A masked dashboard makes a wrong URL undiagnosable.
+
+        Cost a deployment: SEARXNG_URL looked right in the UI but did not
+        resolve, and nothing in the app would say what string it actually held.
+        """
+        from veritas.config import env_summary
+
+        assert "searxng_url" in env_summary()
+
+    def test_health_never_exposes_an_actual_secret(self):
+        from veritas.config import env_summary
+
+        summary = env_summary()
+        for key in ("groq_api_key", "gemini_api_key", "openai_api_key", "SEARXNG_SECRET"):
+            assert key not in summary
