@@ -130,7 +130,21 @@ class TestGeminiConfiguration:
     def test_gemini_model_roles(self):
         settings = self._settings(GEMINI_API_KEY="k")
         assert "flash-lite" in settings.model_for("fast")
-        assert settings.model_for("strong") != settings.model_for("fast")
+
+    def test_neither_role_uses_the_20_per_day_model(self):
+        """gemini-3.5-flash is the better model but is capped at 20/DAY.
+
+        At ~8 strong calls per run that limited the whole system to 2 runs a
+        day, and once exhausted every call 429'd until the next reset. Both
+        roles therefore default to Flash-Lite (1,000/day): a slightly weaker
+        adjudicator that runs beats a better one that cannot.
+        """
+        settings = self._settings(GEMINI_API_KEY="k")
+        for role in ("fast", "strong"):
+            _, per_day, _ = free_tier_limits(settings.model_for(role))
+            assert per_day >= 1000, (
+                f"{role} role uses {settings.model_for(role)}, only {per_day}/day"
+            )
 
     def test_gemini_gets_automatic_rate_limits(self):
         """A free Gemini key must be paced without the user configuring anything."""
@@ -685,3 +699,4 @@ class TestSearxngColdStart:
         from veritas.tools.search import SearchClient
 
         assert callable(getattr(SearchClient, "warm_up", None))
+

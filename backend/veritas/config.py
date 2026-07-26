@@ -76,8 +76,17 @@ class Settings(BaseSettings):
     model_fast_gemini: str = Field(
         default="gemini-3.1-flash-lite", alias="VERITAS_MODEL_FAST_GEMINI"
     )
+    # Flash-Lite for BOTH roles, not Flash for the strong one.
+    #
+    # gemini-3.5-flash is a better model but carries only 20 requests per DAY on
+    # the free tier, versus Flash-Lite's 1,000. At ~8 strong calls per run that
+    # capped the whole system at 2 runs/day — and once exhausted every call
+    # 429'd for the rest of the day. Flash-Lite gives 22 runs/day.
+    #
+    # A slightly weaker adjudicator that runs is worth more than a better one
+    # that cannot. Override if you have a paid key.
     model_strong_gemini: str = Field(
-        default="gemini-3.5-flash", alias="VERITAS_MODEL_STRONG_GEMINI"
+        default="gemini-3.1-flash-lite", alias="VERITAS_MODEL_STRONG_GEMINI"
     )
     # Chosen by measuring a live free key. Groq's binding constraint is TOKENS
     # per minute, not requests, so the high-volume role must get the model with
