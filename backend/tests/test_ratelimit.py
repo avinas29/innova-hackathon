@@ -559,3 +559,70 @@ class TestPromptFitting:
         limiters = ModelRateLimiters({"m": (0, 1000, 8000)})
         assert limiters.token_budget("m") == 8000
         assert limiters.token_budget("unknown") == 0
+
+
+class TestSplitProviders:
+    """Running the two roles on different providers doubles free-tier capacity.
+
+    Quota, not capability, is the binding constraint on free tiers. Drawing on
+    two independent allowances at once roughly doubles the runs per day.
+    """
+
+    def _settings(self, **overrides) -> Settings:
+        base = {
+            "OPENAI_API_KEY": "",
+            "ANTHROPIC_API_KEY": "",
+            "GEMINI_API_KEY": "m",
+            "GROQ_API_KEY": "g",
+            "VERITAS_LLM_PROVIDER": "auto",
+        }
+        return Settings(**{**base, **overrides})  # type: ignore[arg-type]
+
+    def test_roles_can_use_different_providers(self):
+        s = self._settings(
+            VERITAS_PROVIDER_FAST="groq", VERITAS_PROVIDER_STRONG="gemini"
+        )
+        assert s.provider_for("fast") == "groq"
+        assert s.provider_for("strong") == "gemini"
+        assert s.split_providers
+
+    def test_models_follow_their_role_provider(self):
+        s = self._settings(
+            VERITAS_PROVIDER_FAST="groq", VERITAS_PROVIDER_STRONG="gemini"
+        )
+        assert "llama" in s.model_for("fast")
+        assert "gemini" in s.model_for("strong")
+
+    def test_rate_limits_cover_both_providers_models(self):
+        """Each provider's quota is tracked separately — that is the point."""
+        s = self._settings(
+            VERITAS_PROVIDER_FAST="groq", VERITAS_PROVIDER_STRONG="gemini"
+        )
+        limits = s.effective_rate_limits()
+        assert s.model_for("fast") in limits
+        assert s.model_for("strong") in limits
+
+    def test_unset_overrides_fall_back_to_one_provider(self):
+        s = self._settings()
+        assert not s.split_providers
+        assert s.provider_for("fast") == s.provider_for("strong") == "groq"
+
+    def test_single_provider_override_still_works(self):
+        """The simple case: force everything onto Gemini with one variable."""
+        s = self._settings(VERITAS_LLM_PROVIDER="gemini")
+        assert s.provider_for("fast") == "gemini"
+        assert s.provider_for("strong") == "gemini"
+        assert not s.split_providers
+
+    async def test_client_builds_one_backend_per_role(self, settings, monkeypatch):
+        from veritas.llm.client import LLMClient, OfflineProvider
+
+        client = LLMClient(settings, provider=OfflineProvider())
+        assert set(client.provider_names) == {"fast", "strong"}
+
+    async def test_cache_key_includes_the_provider(self):
+        """A split run must not serve one provider's response for another's."""
+        from veritas.llm.client import _cache_key, user
+
+        msgs = [user("same prompt")]
+        assert _cache_key("groq", "m", msgs, False) != _cache_key("gemini", "m", msgs, False)

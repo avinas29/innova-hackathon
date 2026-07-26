@@ -43,6 +43,19 @@ class Settings(BaseSettings):
     gemini_api_key: str = Field(default="", alias="GEMINI_API_KEY")
     groq_api_key: str = Field(default="", alias="GROQ_API_KEY")
     llm_provider: Provider = Field(default="auto", alias="VERITAS_LLM_PROVIDER")
+    # Per-role provider override — the two roles can run on DIFFERENT providers.
+    #
+    # Quota, not capability, is the binding constraint on free tiers. Splitting
+    # by role draws on two independent allowances at once, roughly doubling how
+    # many runs a day are possible, and lets each provider do what it is best
+    # at: Groq for the high-volume fast role (sub-second, large token budget),
+    # a stronger model for adjudication where quality moves the verdict.
+    #
+    # Split by ROLE rather than round-robin: role assignment is deterministic,
+    # so identical prompts always hit the same provider and stay cacheable, and
+    # a run stays reproducible. Random splitting would defeat both.
+    provider_fast: Provider | None = Field(default=None, alias="VERITAS_PROVIDER_FAST")
+    provider_strong: Provider | None = Field(default=None, alias="VERITAS_PROVIDER_STRONG")
 
     model_fast: str = Field(default="gpt-4.1-mini", alias="VERITAS_MODEL_FAST")
     model_strong: str = Field(default="gpt-4.1", alias="VERITAS_MODEL_STRONG")
@@ -215,9 +228,21 @@ class Settings(BaseSettings):
             return "gemini"
         return "fake"
 
+    def provider_for(self, role: Literal["fast", "strong"]) -> Provider:
+        """Provider serving one role, honouring a per-role override."""
+        explicit = self.provider_fast if role == "fast" else self.provider_strong
+        if explicit and explicit != "auto":
+            return explicit
+        return self.resolved_provider
+
+    @property
+    def split_providers(self) -> bool:
+        """True when the two roles run on different providers."""
+        return self.provider_for("fast") != self.provider_for("strong")
+
     def model_for(self, role: Literal["fast", "strong"]) -> str:
-        """Model id for a role under the resolved provider."""
-        provider = self.resolved_provider
+        """Model id for a role, under whichever provider serves that role."""
+        provider = self.provider_for(role)
         if provider == "anthropic":
             return self.model_strong_anthropic if role == "strong" else self.model_fast_anthropic
         if provider == "gemini":
@@ -251,12 +276,13 @@ class Settings(BaseSettings):
         if self.rpm_limit or self.daily_limit:
             return dict.fromkeys(models, (self.rpm_limit, self.daily_limit, 0))
 
-        if self.resolved_provider in {"gemini", "groq"}:
-            from veritas.llm.ratelimit import free_tier_limits
+        from veritas.llm.ratelimit import free_tier_limits
 
-            return {m: free_tier_limits(m) for m in models}
-
-        return {}
+        limits: dict[str, tuple[int, int, int]] = {}
+        for role in ("fast", "strong"):
+            if self.provider_for(role) in {"gemini", "groq"}:
+                limits[self.model_for(role)] = free_tier_limits(self.model_for(role))
+        return limits
 
     def rate_limit_summary(self) -> str:
         """One-line human summary of the active limits."""

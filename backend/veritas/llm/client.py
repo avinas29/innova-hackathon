@@ -743,13 +743,33 @@ class LLMClient:
         from veritas.llm.ratelimit import ModelRateLimiters
 
         self.settings = settings or get_settings()
-        self._provider = provider or self._build_provider()
+
+        # One provider per role. They may be the same object (the common case)
+        # or two different backends when the roles are split across providers
+        # to draw on two free-tier quotas at once.
+        if provider is not None:
+            self._by_role: dict[str, BaseProvider] = {"fast": provider, "strong": provider}
+        else:
+            fast = self._build_provider(self.settings.provider_for("fast"))
+            strong = (
+                fast
+                if self.settings.provider_for("strong") == self.settings.provider_for("fast")
+                else self._build_provider(self.settings.provider_for("strong"))
+            )
+            self._by_role = {"fast": fast, "strong": strong}
+
+        if self.settings.split_providers:
+            log.info(
+                "roles split across providers",
+                fast=f"{self._by_role['fast'].name}:{self.settings.model_for('fast')}",
+                strong=f"{self._by_role['strong'].name}:{self.settings.model_for('strong')}",
+            )
 
         self._limiters = ModelRateLimiters(self.settings.effective_rate_limits())
         if self._limiters.enabled:
             log.info(
                 "client-side rate limiting active",
-                provider=self._provider.name,
+                providers=",".join(sorted({p.name for p in self._by_role.values()})),
                 limits=self.settings.rate_limit_summary(),
             )
 
@@ -757,8 +777,8 @@ class LLMClient:
         self._usage_lock = asyncio.Lock()
         self._cache_hits = 0
 
-    def _build_provider(self) -> BaseProvider:
-        kind = self.settings.resolved_provider
+    def _build_provider(self, kind: str | None = None) -> BaseProvider:
+        kind = kind or self.settings.resolved_provider
         if kind == "openai":
             return OpenAIProvider(self.settings.openai_api_key)
         if kind == "anthropic":
@@ -785,7 +805,12 @@ class LLMClient:
 
     @property
     def provider_name(self) -> str:
-        return self._provider.name
+        """Name of the provider serving the fast role (the default surface)."""
+        return self._by_role["fast"].name
+
+    @property
+    def provider_names(self) -> dict[str, str]:
+        return {role: p.name for role, p in self._by_role.items()}
 
     @property
     def cache_hits(self) -> int:
@@ -822,12 +847,20 @@ class LLMClient:
 
         cache_key = None
         if use_cache and self.settings.cache_enabled and temperature == 0.0:
-            cache_key = _cache_key(self._provider.name, model, tagged, json_mode)
+            cache_key = _cache_key(
+                self._by_role["strong" if role == "strong" else "fast"].name,
+                model,
+                tagged,
+                json_mode,
+            )
             cached = await asyncio.to_thread(_cache_lookup, cache_key, self.settings)
             if cached is not None:
                 self._cache_hits += 1
                 return LLMResult(
-                    text=cached, provider=self._provider.name, model=model, cached=True
+                    text=cached,
+                    provider=self._by_role["strong" if role == "strong" else "fast"].name,
+                    model=model,
+                    cached=True,
                 )
 
         # Some providers apply the per-minute token cap to a SINGLE request, so
@@ -853,7 +886,8 @@ class LLMClient:
         estimated = estimate_tokens("".join(m.content for m in tagged)) + max_tokens
         await self._limiters.acquire(model, estimated_tokens=estimated)
 
-        result = await self._provider.complete(
+        backend = self._by_role["strong" if role == "strong" else "fast"]
+        result = await backend.complete(
             tagged, model, temperature, max_tokens, json_mode
         )
         await self._record(result.usage)
@@ -933,7 +967,8 @@ class LLMClient:
             ) from exc
 
     async def aclose(self) -> None:
-        await self._provider.aclose()
+        for backend in {id(p): p for p in self._by_role.values()}.values():
+            await backend.aclose()
 
 
 def fit_to_token_budget(

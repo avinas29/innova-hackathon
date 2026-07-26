@@ -35,6 +35,13 @@ services:
 
       - key: VERITAS_LLM_PROVIDER
         value: auto
+      # Split roles across providers to use two free-tier quotas at once.
+      # Set both to swap which model does what without touching code; leave
+      # blank to run everything on one provider.
+      - key: VERITAS_PROVIDER_FAST
+        sync: false
+      - key: VERITAS_PROVIDER_STRONG
+        sync: false
       # The free plan has limited CPU and the free Gemini tier limited quota;
       # this profile keeps a run inside both.
       - key: VERITAS_PROFILE
