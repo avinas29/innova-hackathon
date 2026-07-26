@@ -18,6 +18,18 @@ from veritas.storage.db import get_db
 log = get_logger(__name__)
 router = APIRouter()
 
+# `Source.content` holds up to 60,000 characters of extracted page text per
+# source — working data the verification pipeline needs and the browser never
+# reads. Serialising it made a finished run's payload ~538 KB, of which 82% was
+# that dead weight. On a small instance the response was slow enough that the
+# browser gave up with a bare "Load failed" after an otherwise successful run.
+_REPORT_EXCLUDE = {"sources": {"__all__": {"content"}}}
+
+
+def public_report(report) -> dict:
+    """Serialise a report for the wire, minus server-side-only bulk."""
+    return report.model_dump(mode="json", exclude=_REPORT_EXCLUDE)
+
 
 class RunAccepted(BaseModel):
     run_id: str
@@ -116,7 +128,7 @@ async def get_run(run_id: str) -> dict:
         "error": handle.error,
         "finished": handle.finished,
         "event_count": len(handle.events),
-        "report": handle.report.model_dump(mode="json") if handle.report else None,
+        "report": public_report(handle.report) if handle.report else None,
     }
 
 

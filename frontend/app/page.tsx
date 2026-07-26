@@ -57,16 +57,38 @@ export default function Home() {
     return () => unsubscribeRef.current?.();
   }, []);
 
+  /**
+   * Fetch the finished run, retrying on transient network failure.
+   *
+   * The run has already succeeded by this point — minutes of work and real API
+   * quota are behind it. Discarding that because one fetch blipped is the worst
+   * possible failure. A free-tier instance is slow enough that the first
+   * request after a long stream can legitimately fail.
+   */
   const loadFinishedRun = useCallback(async (runId: string) => {
-    try {
-      const state = await api.getRun(runId);
-      setRun(state);
-      if (state.report) {
-        setGraph(await api.getGraph(runId).catch(() => null));
-        setTab((current) => (current === "live" ? "claims" : current));
+    for (let attempt = 0; attempt < 4; attempt++) {
+      try {
+        const state = await api.getRun(runId);
+        setRun(state);
+        setError(null);
+        if (state.report) {
+          setGraph(await api.getGraph(runId).catch(() => null));
+          setTab((current) => (current === "live" ? "claims" : current));
+        }
+        return;
+      } catch (exc) {
+        const last = attempt === 3;
+        if (last) {
+          setError(
+            exc instanceof Error
+              ? `Could not load the finished run: ${exc.message}. The run completed — reload the page to retrieve it.`
+              : "could not load run",
+          );
+          return;
+        }
+        setError(`Loading results… (retry ${attempt + 1} of 3)`);
+        await new Promise((r) => setTimeout(r, 1500 * (attempt + 1)));
       }
-    } catch (exc) {
-      setError(exc instanceof Error ? exc.message : "could not load run");
     }
   }, []);
 

@@ -271,3 +271,73 @@ class TestStaticFrontendRouting:
         with TestClient(create_app()) as c:
             body = c.get("/../secret.txt").text
         assert "do-not-serve" not in body
+
+
+class TestPayloadSize:
+    """A finished run's payload must not carry server-side-only bulk.
+
+    `Source.content` holds up to 60,000 chars of extracted page text per source
+    — needed by the verification pipeline, never read by the browser. Shipping
+    it made a real run's response ~538 KB (82% dead weight), slow enough on a
+    small instance that the browser aborted with "Load failed" after an
+    otherwise successful 5-minute run.
+    """
+
+    def test_source_content_is_stripped_from_the_wire(self):
+        from veritas.api.routes import public_report
+        from veritas.schemas import ResearchReport, Source
+
+        report = ResearchReport(
+            run_id="r",
+            topic="t",
+            sources=[Source(url="https://x.test", content="X" * 50_000, title="T")],
+        )
+        payload = public_report(report)
+        assert "content" not in payload["sources"][0]
+
+    def test_fields_the_ui_needs_survive(self):
+        from veritas.api.routes import public_report
+        from veritas.schemas import ResearchReport, Source
+
+        report = ResearchReport(
+            run_id="r",
+            topic="t",
+            sources=[
+                Source(url="https://x.test", domain="x.test", title="Title", content="X" * 9_000)
+            ],
+        )
+        src = public_report(report)["sources"][0]
+        for field in ("id", "url", "domain", "title", "credibility_tier", "credibility_score"):
+            assert field in src, f"UI needs {field}"
+
+    def test_payload_shrinks_substantially(self):
+        import json as json_mod
+
+        from veritas.api.routes import public_report
+        from veritas.schemas import ResearchReport, Source
+
+        report = ResearchReport(
+            run_id="r",
+            topic="t",
+            sources=[
+                Source(url=f"https://x{i}.test", content="X" * 45_000) for i in range(10)
+            ],
+        )
+        full = len(json_mod.dumps(report.model_dump(mode="json")))
+        lean = len(json_mod.dumps(public_report(report)))
+        assert lean < full * 0.3, f"expected a large reduction, got {lean} vs {full}"
+
+    def test_endpoint_response_excludes_content(self, client):
+        import time as _time
+
+        run_id = client.post("/api/runs", json={"topic": "payload size check"}).json()["run_id"]
+        deadline = _time.time() + 90
+        while _time.time() < deadline:
+            body = client.get(f"/api/runs/{run_id}").json()
+            if body["finished"]:
+                break
+            _time.sleep(0.4)
+
+        report = body.get("report")
+        if report and report.get("sources"):
+            assert all("content" not in s for s in report["sources"])
