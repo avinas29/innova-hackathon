@@ -117,6 +117,25 @@ class ResearchRunner:
 
         self.context.emit(run_id, "runner", f"Run started: {topic}")
 
+        # Make sure search is actually awake before the fan-out.
+        #
+        # A run fires several searches at once. Against a cold free-tier
+        # instance they all time out together and the run degrades to
+        # scholarly-only sources — two per question instead of twenty. Waiting
+        # once here costs far less than every query failing, and is usually a
+        # no-op because startup already warmed it.
+        if self.settings.searxng_url and not self.settings.offline:
+            from veritas.tools.search import warm_searxng
+
+            awake = await warm_searxng(self.settings.searxng_url, timeout=75.0)
+            if not awake:
+                self.context.emit(
+                    run_id,
+                    "runner",
+                    "Search backend did not wake — falling back to scholarly sources",
+                    level="warning",
+                )
+
         try:
             final: GraphState = await self.graph.ainvoke(state, config=config)
             status = RunStatus(final.get("status", "COMPLETED"))

@@ -175,16 +175,73 @@ class SearxngProvider(SearchProvider):
     # client timeout is far shorter, so the first query after a quiet spell
     # would always fail and the provider would be skipped for the whole run.
     COLD_START_TIMEOUT = 75.0
+    WAKE_ATTEMPTS = 3
 
     def __init__(self, client: httpx.AsyncClient, base_url: str = "") -> None:
         super().__init__(client, api_key="")
         self.base_url = _normalise_base_url(base_url)
+        self._awake = False
+        self._wake_lock = asyncio.Lock()
 
     @property
     def available(self) -> bool:
         return bool(self.base_url)
 
+    async def _ensure_awake(self) -> None:
+        """Wake a sleeping instance once, with every other caller waiting.
+
+        This is the difference between 2 sources and 24. A run fans out to
+        several researchers, each issuing multiple queries, so a cold instance
+        gets hit by ~6 concurrent requests — and *all* of them fail together
+        before it has finished booting. The run then silently falls back to
+        arXiv and produces a thin report.
+
+        The lock collapses that burst into a single wake request that the rest
+        await, so the instance boots once and every query lands on a live
+        service.
+        """
+        if self._awake:
+            return
+
+        async with self._wake_lock:
+            if self._awake:  # another caller woke it while we queued
+                return
+
+            for attempt in range(self.WAKE_ATTEMPTS):
+                try:
+                    resp = await self.client.get(
+                        f"{self.base_url}/healthz", timeout=self.COLD_START_TIMEOUT
+                    )
+                    if resp.status_code < 500:
+                        if attempt:
+                            log.info("SearXNG awake", url=self.base_url, attempts=attempt + 1)
+                        self._awake = True
+                        return
+                except Exception as exc:
+                    log.info(
+                        "waking SearXNG — a sleeping free instance takes ~50s",
+                        attempt=attempt + 1,
+                        error=type(exc).__name__,
+                    )
+                await asyncio.sleep(2.0 * (attempt + 1))
+
+            # Give up on the probe but still attempt the search: /healthz may be
+            # blocked while the search endpoint itself works.
+            log.warning("SearXNG did not answer /healthz — trying search anyway", url=self.base_url)
+            self._awake = True
+
     async def search(self, query: str, limit: int) -> list[SearchResult]:
+        await self._ensure_awake()
+        try:
+            return await self._search_once(query, limit)
+        except (httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout):
+            # Still booting despite the wake probe — one more try, then give up
+            # to the next provider in the chain.
+            log.info("SearXNG connection failed — retrying once", url=self.base_url)
+            await asyncio.sleep(5.0)
+            return await self._search_once(query, limit)
+
+    async def _search_once(self, query: str, limit: int) -> list[SearchResult]:
         resp = await self.client.get(
             f"{self.base_url}/search",
             params={
@@ -299,6 +356,65 @@ def _unwrap_ddg(href: str) -> str:
     return href
 
 
+async def _suppress(coro) -> None:
+    """Run a background warm-up; never let its failure surface."""
+    try:
+        await coro
+    except Exception as exc:
+        log.debug("warm-up failed", error=str(exc)[:120])
+
+
+async def warm_searxng(
+    base_url: str, timeout: float = 90.0, poll_interval: float = 3.0
+) -> bool:
+    """Wake a sleeping SearXNG instance and wait until it answers.
+
+    Free-tier hosting spins an idle service down; the first request then takes
+    ~50 seconds while the container cold-starts. A research run fires several
+    searches concurrently, so without this they *all* hit the cold instance at
+    once, time out together, and the run silently falls back to scholarly
+    sources — producing two sources per question instead of twenty.
+
+    Waiting once, up front, is far cheaper than every query failing. Called at
+    app startup (fire-and-forget, so the wake overlaps with the user reading the
+    page) and again at the start of each run (awaited, bounded).
+    """
+    from veritas.config import get_settings
+
+    # Respect the hard network kill-switch, whatever the caller passed.
+    if get_settings().offline:
+        return False
+
+    base_url = _normalise_base_url(base_url)
+    if not base_url:
+        return False
+
+    deadline = asyncio.get_running_loop().time() + timeout
+    attempt = 0
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0), follow_redirects=True) as client:
+        while asyncio.get_running_loop().time() < deadline:
+            attempt += 1
+            try:
+                resp = await client.get(f"{base_url}/healthz")
+                if resp.status_code == 200:
+                    if attempt > 1:
+                        log.info("SearXNG is awake", url=base_url, attempts=attempt)
+                    return True
+            except Exception as exc:
+                log.debug(
+                    "SearXNG still waking", url=base_url, attempt=attempt, error=type(exc).__name__
+                )
+            await asyncio.sleep(poll_interval)
+
+    log.warning(
+        "SearXNG did not wake within the timeout — search will fall back",
+        url=base_url,
+        seconds=timeout,
+    )
+    return False
+
+
 def _normalise_base_url(raw: str) -> str:
     """Accept a bare hostname as well as a full URL.
 
@@ -330,6 +446,7 @@ class SearchClient:
         self.client = client or httpx.AsyncClient(
             timeout=httpx.Timeout(20.0, connect=8.0), follow_redirects=True
         )
+        self._warm_tasks: set[asyncio.Task] = set()
         self._providers = self._build_chain()
         log.info(
             "search chain ready",
@@ -361,6 +478,23 @@ class SearchClient:
     @property
     def provider_names(self) -> list[str]:
         return [p.name for p in self._providers]
+
+    def warm_up(self) -> None:
+        """Start waking sleep-prone providers, without blocking the caller.
+
+        Fired when a run's context is built so the ~50s cold start overlaps
+        with planning — which takes a few seconds anyway — instead of being
+        paid in full by the first search.
+        """
+        for provider in self._providers:
+            ensure = getattr(provider, "_ensure_awake", None)
+            if ensure is None:
+                continue
+            task = asyncio.create_task(_suppress(ensure()))
+            # Hold a reference: a bare create_task can be garbage-collected
+            # mid-flight, which would silently cancel the wake.
+            self._warm_tasks.add(task)
+            task.add_done_callback(self._warm_tasks.discard)
 
     async def search(self, query: str, limit: int = 8) -> list[SearchResult]:
         """Return results from the first provider that answers successfully."""

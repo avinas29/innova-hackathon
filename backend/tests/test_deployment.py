@@ -238,3 +238,116 @@ class TestSearxngService:
         """Hand-pasting the URL is the step people forget."""
         render = (self._root / "render.yaml").read_text()
         assert "fromService" in render
+
+
+class TestSearchWarmup:
+    """Free-tier services sleep; a judge will arrive cold.
+
+    A run fires several searches at once. Against a sleeping instance they all
+    time out together and the run degrades to scholarly sources — two per
+    question instead of twenty. The app must wake search itself rather than
+    depending on someone loading a URL beforehand.
+
+    Note these tests inject `poll_interval` rather than patching
+    `asyncio.sleep`. Patching it reaches the real asyncio module and breaks
+    pytest-asyncio's own loop management — the suite hung and was SIGKILLed.
+    """
+
+    def _online(self, monkeypatch):
+        """Opt this test out of the suite-wide network kill-switch.
+
+        warm_searxng honours `offline` — that guard is what stopped a
+        90-second polling task leaking from every API test. Tests that
+        exercise the wake path have to disable it deliberately.
+        """
+        from veritas.config import get_settings
+
+        monkeypatch.setattr(get_settings(), "offline", False)
+
+    def _client(self, responder):
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def get(self, url):
+                return responder(url)
+
+        return lambda **kw: FakeClient()
+
+    async def test_no_url_configured_is_a_no_op(self):
+        from veritas.tools.search import warm_searxng
+
+        assert await warm_searxng("") is False
+
+    async def test_returns_true_once_healthz_answers(self, monkeypatch):
+        import httpx
+
+        from veritas.tools import search as search_mod
+
+        seen = {}
+
+        class Ok:
+            status_code = 200
+
+        def responder(url):
+            seen["url"] = url
+            return Ok()
+
+        self._online(monkeypatch)
+        monkeypatch.setattr(httpx, "AsyncClient", self._client(responder))
+        assert await search_mod.warm_searxng("https://x.test", poll_interval=0.01) is True
+        assert seen["url"].endswith("/healthz")
+
+    async def test_retries_a_sleeping_instance_then_succeeds(self, monkeypatch):
+        import httpx
+
+        from veritas.tools import search as search_mod
+
+        calls = {"n": 0}
+
+        class Ok:
+            status_code = 200
+
+        def responder(url):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise httpx.ConnectError("still waking")
+            return Ok()
+
+        self._online(monkeypatch)
+        monkeypatch.setattr(httpx, "AsyncClient", self._client(responder))
+        result = await search_mod.warm_searxng(
+            "https://x.test", timeout=30, poll_interval=0.01
+        )
+        assert result is True
+        assert calls["n"] == 3
+
+    async def test_gives_up_within_the_timeout(self, monkeypatch):
+        import httpx
+
+        from veritas.tools import search as search_mod
+
+        def responder(url):
+            raise httpx.ConnectError("asleep")
+
+        monkeypatch.setattr(httpx, "AsyncClient", self._client(responder))
+        result = await search_mod.warm_searxng(
+            "https://x.test", timeout=0.15, poll_interval=0.01
+        )
+        assert result is False
+
+    def test_bare_hostname_is_accepted(self):
+        """render.yaml's fromService yields a hostname with no scheme."""
+        from veritas.tools.search import _normalise_base_url
+
+        assert _normalise_base_url("veritas-searxng.onrender.com").startswith("https://")
+
+    async def test_offline_mode_refuses_to_warm(self):
+        """The guard that stopped a 90s polling task leaking per API test."""
+        from veritas.tools.search import warm_searxng
+
+        # conftest sets VERITAS_OFFLINE=true for the whole suite.
+        assert await warm_searxng("https://x.test", poll_interval=0.01) is False

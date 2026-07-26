@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from contextlib import asynccontextmanager
@@ -34,7 +35,27 @@ async def lifespan(app: FastAPI):
     configure_logging(settings.log_level, settings.log_json)
     get_db()  # create schema up front so the first request is not the migration
     log.info("VERITAS API starting", **env_summary())
+
+    # Wake the search backend in the background.
+    #
+    # Both services sleep on free hosting. This one is usually free: the API
+    # itself only starts because someone loaded the page, and they will spend
+    # far longer reading it than SearXNG needs to boot. Deliberately not
+    # awaited — the platform health-checks this process, and blocking startup
+    # on a third-party wake would fail the deploy.
+    # `offline` is the hard network kill-switch the test suite sets. Spawning a
+    # 90-second polling task here regardless left one lingering per API test,
+    # which hung teardown until pytest was SIGKILLed.
+    warm_task: asyncio.Task | None = None
+    if settings.searxng_url and not settings.offline:
+        from veritas.tools.search import warm_searxng
+
+        warm_task = asyncio.create_task(warm_searxng(settings.searxng_url))
+
     yield
+
+    if warm_task is not None and not warm_task.done():
+        warm_task.cancel()
     log.info("VERITAS API shutting down")
 
 

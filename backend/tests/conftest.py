@@ -17,6 +17,7 @@ os.environ.update(
     {
         "VERITAS_LLM_PROVIDER": "fake",
         "VERITAS_SEARCH_ORDER": "",
+        "SEARXNG_URL": "",
         # Hard network kill-switch: the suite must never make a live call.
         "VERITAS_OFFLINE": "true",
         "VERITAS_CACHE_ENABLED": "false",

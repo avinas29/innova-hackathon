@@ -626,3 +626,71 @@ class TestSplitProviders:
 
         msgs = [user("same prompt")]
         assert _cache_key("groq", "m", msgs, False) != _cache_key("gemini", "m", msgs, False)
+
+
+class TestSearxngColdStart:
+    """A sleeping free instance must be woken once, not hammered concurrently.
+
+    A run fans out to several researchers, each issuing multiple queries. Hit a
+    cold instance with ~6 concurrent requests and all of them fail together
+    before it finishes booting — the run then falls back to arXiv and produces
+    a thin report. Observed live: 2 sources instead of 24.
+    """
+
+    def _provider(self, responses):
+        """Provider whose HTTP client returns a scripted sequence."""
+        from veritas.tools.search import SearxngProvider
+
+        class FakeClient:
+            def __init__(self):
+                self.healthz_calls = 0
+
+            async def get(self, url, **kwargs):
+                if url.endswith("/healthz"):
+                    self.healthz_calls += 1
+                    outcome = responses.pop(0) if responses else 200
+                    if isinstance(outcome, Exception):
+                        raise outcome
+                    return type("R", (), {"status_code": outcome})()
+                raise AssertionError("unexpected request")
+
+        client = FakeClient()
+        p = SearxngProvider(client, "https://sx.test")  # type: ignore[arg-type]
+        return p, client
+
+    async def test_wakes_once_then_caches(self):
+        p, client = self._provider([200])
+        await p._ensure_awake()
+        await p._ensure_awake()
+        await p._ensure_awake()
+        assert client.healthz_calls == 1, "wake must not repeat once awake"
+
+    async def test_concurrent_callers_share_a_single_wake(self):
+        """The core fix: 6 parallel searches must cause 1 wake, not 6."""
+        p, client = self._provider([200])
+        await asyncio.gather(*(p._ensure_awake() for _ in range(6)))
+        assert client.healthz_calls == 1
+
+    async def test_retries_a_failing_probe(self, monkeypatch):
+        monkeypatch.setattr(asyncio, "sleep", lambda *_: asyncio.sleep(0))
+        p, client = self._provider([ConnectionError("cold"), ConnectionError("cold"), 200])
+        await p._ensure_awake()
+        assert client.healthz_calls == 3
+        assert p._awake
+
+    async def test_gives_up_but_still_allows_search(self, monkeypatch):
+        """/healthz may be blocked while /search works — don't disable the provider."""
+        monkeypatch.setattr(asyncio, "sleep", lambda *_: asyncio.sleep(0))
+        p, _ = self._provider([ConnectionError("x")] * 5)
+        await p._ensure_awake()
+        assert p._awake, "must still attempt the search after a failed probe"
+
+    def test_cold_start_timeout_covers_paas_wake(self):
+        from veritas.tools.search import SearxngProvider
+
+        assert SearxngProvider.COLD_START_TIMEOUT >= 60
+
+    def test_client_exposes_warm_up(self):
+        from veritas.tools.search import SearchClient
+
+        assert callable(getattr(SearchClient, "warm_up", None))

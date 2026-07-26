@@ -190,6 +190,10 @@ async def build_context(
         contradiction_detector=ContradictionDetector(llm),
         event_sink=event_sink,
     )
+    # Overlap any provider cold start with planning rather than paying it on
+    # the first search.
+    context.search.warm_up()
+
     log.info(
         "run context ready",
         provider=llm.provider_name,
